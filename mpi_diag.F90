@@ -174,10 +174,11 @@ contains
     real(rk), intent(out) :: ws(nz), wd(nz)
     integer :: k, kg, i, j
     integer :: ierr
-    real(rk) :: sum_spd(nz), sum_c(nz), sum_s(nz), sum_cnt(nz)
+    real(rk) :: sum_spd(nz), sum_c(nz), sum_s(nz), sum_cnt(nz), buff(nz)
     real(rk) :: uu, vv, mag, cbar, sbar, ang
 
     sum_spd= 0.0_rk; sum_c= 0.0_rk; sum_s= 0.0_rk; sum_cnt= 0.0_rk
+    buff = 0.0_rk
 
     do k = 1, nzloc
       kg = zs + k - 1
@@ -195,10 +196,14 @@ contains
       end do
     end do
 
-    call MPI_Allreduce(MPI_IN_PLACE, sum_spd, nz, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
-    call MPI_Allreduce(MPI_IN_PLACE, sum_c,   nz, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
-    call MPI_Allreduce(MPI_IN_PLACE, sum_s,   nz, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
-    call MPI_Allreduce(MPI_IN_PLACE, sum_cnt, nz, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
+    call MPI_Allreduce(sum_spd, buff, nz, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
+    sum_spd = buff
+    call MPI_Allreduce(sum_c, buff, nz, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
+    sum_c = buff
+    call MPI_Allreduce(sum_s, buff, nz, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
+    sum_s = buff
+    call MPI_Allreduce(sum_cnt, buff, nz, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
+    sum_cnt = buff
 
     do kg = 1, nz      
       if (sum_cnt(kg) > 0.5_rk) then
@@ -221,9 +226,9 @@ contains
     real(rk), intent(out) :: profile(nz)
     integer :: k, kg, i, j
     integer :: ierr
-    real(rk) :: sum_f(nz), sum_cnt(nz)
+    real(rk) :: sum_f(nz), sum_cnt(nz), buff(nz)
 
-    sum_f= 0.0_rk; sum_cnt(nz)= 0.0_rk
+    sum_f= 0.0_rk; sum_cnt= 0.0_rk; buff=0.0_rk
     do k = 1, nzloc
       kg = zs + k - 1
       do j = 1, nyloc
@@ -234,8 +239,10 @@ contains
       end do
     end do
 
-    call MPI_Allreduce(MPI_IN_PLACE, sum_f, nz, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
-    call MPI_Allreduce(MPI_IN_PLACE, sum_cnt, nz, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
+    call MPI_Allreduce(sum_f, buff, nz, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
+    sum_f = buff
+    call MPI_Allreduce(sum_cnt, buff, nz, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
+    sum_cnt = buff
 
     do kg = 1, nz      
       if (sum_cnt(kg) > 0.5_rk) then
@@ -305,6 +312,244 @@ contains
     end do
   end subroutine ha_driver
 
+  subroutine slice_driver(reader, Lx, Ly, Lz, runid, path, outdir, field, axis, slice_coord)
+    class(FieldReader2Decomp), intent(inout) :: reader
+    integer,          intent(in)  :: runid
+    character(*),     intent(in)  :: path, outdir, field
+    real(rk),         intent(in)  :: Lx, Ly, Lz, slice_coord
+    character(*),     intent(in)  :: axis   ! e.g. 'z'
+
+    ! Local 3D field
+    real(rk), allocatable, target :: f1(:,:,:)
+
+    ! Grid and indices
+    integer :: nx, ny, nz
+    integer :: nxloc, nyloc, nzloc
+    integer :: xs, xe, ys, ye, zs, ze
+
+    ! Global coordinates
+    real(rk), allocatable :: x1(:), x2(:)
+
+    ! Slice indices and interpolation
+    integer :: k, k0, k1
+    real(rk) :: alpha
+    character(len=2) :: rc
+    character(len=10) :: f_
+    character(len=1) :: ax, x1name, x2name
+    character(len=256) :: fname
+
+    ! Time keys
+    character(len=:), allocatable :: keys(:), sorted_keys(:)
+
+    ! Slice arrays (global shape on every rank)
+    real(rk), allocatable :: local_slice0(:,:), local_slice1(:,:)
+    real(rk), allocatable :: global_slice0(:,:), global_slice1(:,:), slice_interp(:,:)
+    real(rk), pointer :: slice_ptr(:,:)
+
+    integer :: i, j, ierr, nx1, nx2, nax
+    integer :: x1s, x1e, x2s, x2e, axs, axe
+    real(rk) :: L1, L2, Lax
+
+    ! Handling reference to wind speed and wind direction
+    if(trim(field) == 'S')then
+      if(myrank == 0) call message('ERROR(Slice): Export u and v separately and calculate WS & WD offline.')
+      call MPI_Abort(MPI_COMM_WORLD, 100, ierr)
+    end if
+
+    ! Convert runid to character
+    write(rc, '(I2.2)') runid
+    f_ = field_to_name(trim(field))
+    ax = to_lower(axis(1:1))
+
+    ! Shapes and local indices
+    call reader%local_shape(nxloc, nyloc, nzloc)
+    call reader%global_shape(nx, ny, nz)
+    call reader%indices(xs, xe, ys, ye, zs, ze)
+
+    ! Allocate local 3D field
+    allocate(f1(nxloc, nyloc, nzloc))
+
+    ! Figure which coordinate names to use
+    select case (ax)
+    case ('x')
+      x1name = 'y'; x2name = 'z'
+      nx1 = ny; nx2 = nz; nax = nx
+      L1 = Ly; L2 = Lz; Lax = Lx
+      x1s = ys; x1e = ye; x2s = zs; x2e = ze
+      axs = xs; axe = xe
+    case ('y')
+      x1name = 'x'; x2name = 'z'
+      nx1 = nx; nx2 = nz; nax = ny
+      L1 = Lx; L2 = Lz; Lax = Ly
+      x1s = xs; x1e = xe; x2s = zs; x2e = ze
+      axs = ys; axe = ye
+    case ('z')
+      x1name = 'x'; x2name = 'y' 
+      nx1 = nx; nx2 = ny; nax = nz
+      L1 = Lx; L2 = Ly; Lax = Lz
+      x1s = xs; x1e = xe; x2s = ys; x2e = ye
+      axs = zs; axe = ze
+    end select
+
+    ! Global coordinate arrays (same on all ranks)
+    x1 = linspace(0.0_rk, L1, nx1)
+    x2 = linspace(0.0_rk, L2, nx2)
+
+    ! Global slice arrays (same shape on all ranks)
+    allocate(local_slice0(nx1, nx2), local_slice1(nx1, nx2))
+    allocate(global_slice0(nx1, nx2), global_slice1(nx1, nx2))
+    allocate(slice_interp(nx1, nx2))
+
+    ! Compute bracketing indices for z
+    call find_bracket_uniform(nax, Lax, slice_coord, k0, k1, alpha)
+    if (myrank == 0) then
+      write(*,'(A, I0, A, I0, A, ES12.4)') 'slice_driver('//ax//'): k0=', k0, ', k1=', k1, ', alpha=', alpha
+    end if
+
+    ! Get file list and sort by time
+    call list_matching_keys(trim(path), 'Run'//trim(rc)//'_'//trim(f_)//'_t*.out', keys)
+    sorted_keys = sort_keys_numeric(keys)
+
+    ! Loop over time snapshots
+    do k = 1, size(sorted_keys)
+
+      ! 1) Read 3D field for this time step on each rank
+      f1 = reader%read_field( &
+          trim(path)//'/'//'Run'//trim(rc)//'_'//trim(f_)//'_t'//trim(sorted_keys(k))//'.out')
+
+      ! 2) Build local contributions to the two bracketing planes
+      local_slice0 = 0.0_rk
+      local_slice1 = 0.0_rk
+
+      block
+        logical :: has0, has1
+        integer :: k0_loc, k1_loc
+
+        has0 = (k0 >= axs .and. k0 <= axe)
+        has1 = (k1 >= axs .and. k1 <= axe)
+
+        if (has0) then
+          k0_loc = k0 - axs + 1
+          select case(ax)
+          case('x')
+            slice_ptr => f1(k0_loc,:,:)
+          case('y')
+            slice_ptr => f1(:,k0_loc,:)
+          case('z')
+            slice_ptr => f1(:,:,k0_loc)
+          end select
+          local_slice0(x1s:x1e, x2s:x2e) = slice_ptr(:,:)
+        end if
+
+        if (has1) then
+          k1_loc = k1 - axs + 1
+          select case(ax)
+          case('x')
+            slice_ptr => f1(k1_loc,:,:)
+          case('y')
+            slice_ptr => f1(:,k1_loc,:)
+          case('z')
+            slice_ptr => f1(:,:,k1_loc)
+          end select
+          local_slice1(x1s:x1e, x2s:x2e) = slice_ptr(:,:)
+        end if
+      end block
+
+      ! 3) Sum contributions from all ranks to get full global slices
+      call MPI_Allreduce(local_slice0, global_slice0, nx1*nx2, MPI_DOUBLE_PRECISION, &
+                        MPI_SUM, MPI_COMM_WORLD, ierr)
+      call MPI_Allreduce(local_slice1, global_slice1, nx1*nx2, MPI_DOUBLE_PRECISION, &
+                        MPI_SUM, MPI_COMM_WORLD, ierr)
+
+      ! 4) On root: do linear interpolation and write CSV
+      if (myrank == 0) then
+        do j = 1, nx2
+          do i = 1, nx1
+            slice_interp(i,j) = (1.0_rk - alpha) * global_slice0(i,j) + alpha * global_slice1(i,j)
+          end do
+        end do
+
+        fname = trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))// &
+                '_SL_'//trim(f_)//'_'//ax//'='//trim(real2string(slice_coord))//'.csv'
+
+        call writeslice(nx1, nx2, trim(fname), slice_interp)
+      end if
+
+      call MPI_Barrier(MPI_COMM_WORLD, ierr)
+
+    end do  ! time loop
+
+    ! Cleanup
+    if (allocated(f1))           deallocate(f1)
+    if (allocated(x1))           deallocate(x1)
+    if (allocated(x2))           deallocate(x2)
+    if (allocated(local_slice0)) deallocate(local_slice0)
+    if (allocated(local_slice1)) deallocate(local_slice1)
+    if (allocated(global_slice0)) deallocate(global_slice0)
+    if (allocated(global_slice1)) deallocate(global_slice1)
+    if (allocated(slice_interp))  deallocate(slice_interp)
+  end subroutine slice_driver
+
+  pure function real2string(z) result(tag)
+    ! Convert slice coordinate (e.g. 0.25) to a compact string "0p25"
+    ! Unnecessary trailing zeros are removed:
+    !   0.250  -> "0p25"
+    !   1.000  -> "1"
+
+    real(rk), intent(in) :: z
+    character(len=32)    :: tag
+    character(len=64) :: tmp
+    integer :: i, n
+
+    ! 1) Write with fixed decimals (adjust precision as you like)
+    write(tmp, '(F15.8)') z      ! e.g. "      0.25000000"
+
+    ! 2) Left-adjust and trim spaces on the right
+    tmp = adjustl(tmp)
+    n   = len_trim(tmp)          ! now e.g. "0.25000000"
+
+    ! 3) Replace '.' with 'p'
+    do i = 1, n
+      if (tmp(i:i) == '.') tmp(i:i) = 'p'
+    end do
+    ! e.g. "0p25000000"
+
+    ! 4) Remove trailing zeros
+    do while (n > 0 .and. tmp(n:n) == '0')
+      n = n - 1
+    end do
+    ! e.g. "0p25"
+
+    ! 5) If we ended up with only integer part ("1p"), drop 'p'
+    if (n > 0 .and. tmp(n:n) == 'p') then
+      n = n - 1
+    end if
+
+    ! 6) Edge case: if everything vanished (z ~ 0), return "0"
+    if (n <= 0) then
+      tag = '0'
+    else
+      tag = tmp(1:n)
+      if (n < len(tag)) tag(n+1:) = ' '
+    end if
+  end function real2string
+
+  ! Utility function to convert character to lower case
+  pure function to_lower(str) result(out)
+    character(*), intent(in) :: str
+    character(len(str))      :: out
+    integer :: i, c
+
+    do i = 1, len(str)
+      c = iachar(str(i:i))
+      if (c >= iachar('A') .and. c <= iachar('Z')) then
+        out(i:i) = achar(c + 32)   ! ASCII: 'A'..'Z' → 'a'..'z'
+      else
+        out(i:i) = str(i:i)
+      end if
+    end do
+  end function to_lower
+
   ! Utility function to generate linearly spaced array
   pure function linspace(a, b, n) result(x)
     real(kind=8), intent(in) :: a, b
@@ -359,7 +604,7 @@ contains
 
     n = size(z)
     if (size(profile) /= n) then
-      call message('ERROR(CSV): z and profile size mismatch.')
+      if(myrank == 0) call message('ERROR(CSV): z and profile size mismatch.')
       call MPI_Abort(MPI_COMM_WORLD, 100, ierr)
     end if
 
@@ -371,7 +616,94 @@ contains
     close(uo)
   end subroutine csvprofile
 
-! Escape single quotes so we can safely single-quote strings in the shell command
+  !---------------------------------------------------------------------------
+  ! Write a 2D slice f(x1,x2) as CSV:
+  !   - nx1 rows (i = 1..nx1)
+  !   - nx2 columns (j = 1..nx2)
+  !   - comma-separated, one row per line
+  !---------------------------------------------------------------------------
+  subroutine writeslice(nx1, nx2, filename, slice)
+    integer,      intent(in) :: nx1, nx2
+    character(*), intent(in) :: filename
+    real(rk),     intent(in) :: slice(nx1, nx2)
+
+    integer :: i, j, uo, ierr
+
+    open(newunit=uo, file=trim(filename), status='replace', action='write', iostat=ierr)
+    if (ierr /= 0) then
+      if (myrank == 0) call message('ERROR(writeslice): cannot open file '//trim(filename))
+      return
+    end if
+
+    do i = 1, nx1
+      ! First column
+      write(uo, '(ES23.15)', advance='no') slice(i, 1)
+
+      ! Remaining columns with leading commas
+      do j = 2, nx2
+        write(uo, '(",",ES23.15)', advance='no') slice(i, j)
+      end do
+
+      ! End of line
+      write(uo, *)   ! advance to next line
+    end do
+
+    close(uo)
+  end subroutine writeslice
+
+  !---------------------------------------------------------------------------
+  ! Given a uniform grid in [0, L] with n points (1-based),
+  ! find k0, k1 and alpha such that
+  !   f(z0) ≈ (1 - alpha) * f(k0) + alpha * f(k1)
+  !
+  ! If z0 is outside [0,L], clamp it and set k0 = k1, alpha = 0.
+  !---------------------------------------------------------------------------
+  subroutine find_bracket_uniform(n, L, z0, k0, k1, alpha)
+    integer,  intent(in)  :: n
+    real(rk), intent(in)  :: L, z0
+    integer,  intent(out) :: k0, k1
+    real(rk), intent(out) :: alpha
+    real(rk) :: dz, zz, s
+
+    if (n <= 1) then
+      k0    = 1
+      k1    = 1
+      alpha = 0.0_rk
+      return
+    end if
+
+    dz = L / real(n - 1, rk)
+
+    ! Clamp z0 to [0, L]
+    zz = max(0.0_rk, min(L, z0))
+
+    ! Left boundary
+    if (zz <= 0.0_rk) then
+      k0    = 1
+      k1    = 1
+      alpha = 0.0_rk
+      return
+    end if
+
+    ! Right boundary
+    if (zz >= L) then
+      k0    = n
+      k1    = n
+      alpha = 0.0_rk
+      return
+    end if
+
+    ! Now 0 < zz < L, so we’re between grid points
+    ! s is between 0 and (n-1)
+    s  = zz / dz                ! distance in "index" units from point 1 (0-based)
+    k0 = int(floor(s)) + 1      ! 1 <= k0 <= n-1
+    k1 = k0 + 1                 ! 2 <= k1 <= n
+
+    ! local coordinate between k0 and k1
+    alpha = (zz - dz * real(k0 - 1, rk)) / dz
+  end subroutine find_bracket_uniform
+
+  ! Escape single quotes so we can safely single-quote strings in the shell command
   pure function escape_single_quotes(s) result(t)
     character(*), intent(in) :: s
     character(len=:), allocatable :: t
@@ -712,7 +1044,10 @@ program MPIR3D_
   real(rk):: Lx=1.0_rk, Ly=1.0_rk, Lz=1.0_rk
   integer :: nlen, ioUnit=28
   character(:), allocatable :: inputfile
-  namelist /SETUP/ nx, ny, nz, Lx, Ly, Lz, path, outdir, runid, taskid, field 
+  character(len=1) :: slice_axis = 'z'
+  real(rk) :: slice_coord = 0.0_rk
+  namelist /SETUP/ nx, ny, nz, Lx, Ly, Lz, path, outdir, runid, taskid, field, &
+                   slice_axis, slice_coord
       
   ! Initiate MPI
   ! -------------------------------------------------------------------------!
@@ -721,7 +1056,7 @@ program MPIR3D_
   call MPI_Comm_size(MPI_COMM_WORLD, nprocs, ierr)
 
   if (command_argument_count() < 1) then
-    call message('Usage: MPIR3D <inputfile>')
+    if(myrank == 0) call message('Usage: MPIR3D <inputfile>')
     call MPI_Abort(MPI_COMM_WORLD, 1, ierr)
   else
     call get_command_argument(1, length=nlen)
@@ -743,6 +1078,9 @@ program MPIR3D_
   if (taskid == 0)then
     ! Horizontal average
     call ha_driver(reader, Lz, runid, path, outdir, field)
+  else if (taskid == 1) then
+    ! Slice
+    call slice_driver(reader, Lx, Ly, Lz, runid, path, outdir, field, slice_axis, slice_coord)
   end if
   
   if(myrank == 0) call message('Wrapping up ...')
