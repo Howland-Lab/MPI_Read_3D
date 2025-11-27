@@ -312,11 +312,11 @@ contains
     end do
   end subroutine ha_driver
 
-  subroutine slice_driver(reader, Lx, Ly, Lz, runid, path, outdir, field, axis, slice_coord)
+  subroutine slice_driver(reader, Lx, Ly, Lz, runid, path, outdir, field, axis, nslice, slice_coord)
     class(FieldReader2Decomp), intent(inout) :: reader
-    integer,          intent(in)  :: runid
+    integer,          intent(in)  :: runid, nslice
     character(*),     intent(in)  :: path, outdir, field
-    real(rk),         intent(in)  :: Lx, Ly, Lz, slice_coord
+    real(rk),         intent(in)  :: Lx, Ly, Lz, slice_coord(nslice)
     character(*),     intent(in)  :: axis   ! e.g. 'z'
 
     ! Local 3D field
@@ -333,22 +333,22 @@ contains
     ! Slice indices and interpolation
     integer :: k, k0, k1
     real(rk) :: alpha
-    character(len=2) :: rc
+    character(len=2) :: rc, term
     character(len=10) :: f_
-    character(len=1) :: ax, x1name, x2name
-    character(len=256) :: fname
+    character(len=1) :: ax, x1name, x2name, budget, eax
+    character(len=256) :: fname, msg
 
     ! Time keys
-    character(len=:), allocatable :: keys(:), sorted_keys(:)
+    character(len=:), allocatable :: keys(:), sorted_keys(:), stamps(:), sorted_stamps(:)
 
     ! Slice arrays (global shape on every rank)
     real(rk), allocatable :: local_slice0(:,:), local_slice1(:,:)
     real(rk), allocatable :: global_slice0(:,:), global_slice1(:,:), slice_interp(:,:)
     real(rk), pointer :: slice_ptr(:,:)
 
-    integer :: i, j, ierr, nx1, nx2, nax
-    integer :: x1s, x1e, x2s, x2e, axs, axe
-    real(rk) :: L1, L2, Lax
+    integer :: i, j, isl, ierr, nx1, nx2, nax
+    integer :: x1s, x1e, x2s, x2e, axs, axe, mode
+    real(rk) :: L1, L2, Lax, slice_
 
     ! Handling reference to wind speed and wind direction
     if(trim(field) == 'S')then
@@ -358,7 +358,6 @@ contains
 
     ! Convert runid to character
     write(rc, '(I2.2)') runid
-    f_ = field_to_name(trim(field))
     ax = to_lower(axis(1:1))
 
     ! Shapes and local indices
@@ -369,6 +368,20 @@ contains
     ! Allocate local 3D field
     allocate(f1(nxloc, nyloc, nzloc))
 
+    ! Get file list and sort by time
+    mode = field_mode(trim(field))
+    if (mode == 0)then
+      f_ = field_to_name(trim(field))
+      call list_matching_keys(trim(path), 'Run'//trim(rc)//'_'//trim(f_)//'_t*.out', keys)
+      sorted_keys = sort_keys_numeric(keys)
+    else
+      f_ = trim(field)
+      call define_budget(trim(field), budget, term) 
+      call list_matching_keys_budget(trim(path), &
+        'Run'//trim(rc)//'_budget'//budget//'_term'//term//'_t*_n~.s3D', keys, stamps)
+      call sort_keys_and_stamps_numeric(keys, stamps, sorted_keys, sorted_stamps)
+    end if    
+
     ! Figure which coordinate names to use
     select case (ax)
     case ('x')
@@ -377,18 +390,21 @@ contains
       L1 = Ly; L2 = Lz; Lax = Lx
       x1s = ys; x1e = ye; x2s = zs; x2e = ze
       axs = xs; axe = xe
+      eax = 'i'
     case ('y')
       x1name = 'x'; x2name = 'z'
       nx1 = nx; nx2 = nz; nax = ny
       L1 = Lx; L2 = Lz; Lax = Ly
       x1s = xs; x1e = xe; x2s = zs; x2e = ze
       axs = ys; axe = ye
+      eax = 'j'
     case ('z')
       x1name = 'x'; x2name = 'y' 
       nx1 = nx; nx2 = ny; nax = nz
       L1 = Lx; L2 = Ly; Lax = Lz
       x1s = xs; x1e = xe; x2s = ys; x2e = ye
       axs = zs; axe = ze
+      eax = 'k'
     end select
 
     ! Global coordinate arrays (same on all ranks)
@@ -400,84 +416,102 @@ contains
     allocate(global_slice0(nx1, nx2), global_slice1(nx1, nx2))
     allocate(slice_interp(nx1, nx2))
 
-    ! Compute bracketing indices for z
-    call find_bracket_uniform(nax, Lax, slice_coord, k0, k1, alpha)
-    if (myrank == 0) then
-      write(*,'(A, I0, A, I0, A, ES12.4)') 'slice_driver('//ax//'): k0=', k0, ', k1=', k1, ', alpha=', alpha
-    end if
-
-    ! Get file list and sort by time
-    call list_matching_keys(trim(path), 'Run'//trim(rc)//'_'//trim(f_)//'_t*.out', keys)
-    sorted_keys = sort_keys_numeric(keys)
-
-    ! Loop over time snapshots
-    do k = 1, size(sorted_keys)
-
-      ! 1) Read 3D field for this time step on each rank
-      f1 = reader%read_field( &
-          trim(path)//'/'//'Run'//trim(rc)//'_'//trim(f_)//'_t'//trim(sorted_keys(k))//'.out')
-
-      ! 2) Build local contributions to the two bracketing planes
-      local_slice0 = 0.0_rk
-      local_slice1 = 0.0_rk
-
-      block
-        logical :: has0, has1
-        integer :: k0_loc, k1_loc
-
-        has0 = (k0 >= axs .and. k0 <= axe)
-        has1 = (k1 >= axs .and. k1 <= axe)
-
-        if (has0) then
-          k0_loc = k0 - axs + 1
-          select case(ax)
-          case('x')
-            slice_ptr => f1(k0_loc,:,:)
-          case('y')
-            slice_ptr => f1(:,k0_loc,:)
-          case('z')
-            slice_ptr => f1(:,:,k0_loc)
-          end select
-          local_slice0(x1s:x1e, x2s:x2e) = slice_ptr(:,:)
-        end if
-
-        if (has1) then
-          k1_loc = k1 - axs + 1
-          select case(ax)
-          case('x')
-            slice_ptr => f1(k1_loc,:,:)
-          case('y')
-            slice_ptr => f1(:,k1_loc,:)
-          case('z')
-            slice_ptr => f1(:,:,k1_loc)
-          end select
-          local_slice1(x1s:x1e, x2s:x2e) = slice_ptr(:,:)
-        end if
-      end block
-
-      ! 3) Sum contributions from all ranks to get full global slices
-      call MPI_Allreduce(local_slice0, global_slice0, nx1*nx2, MPI_DOUBLE_PRECISION, &
-                        MPI_SUM, MPI_COMM_WORLD, ierr)
-      call MPI_Allreduce(local_slice1, global_slice1, nx1*nx2, MPI_DOUBLE_PRECISION, &
-                        MPI_SUM, MPI_COMM_WORLD, ierr)
-
-      ! 4) On root: do linear interpolation and write CSV
+    do isl = 1, nslice
+      slice_ = slice_coord(isl)
       if (myrank == 0) then
-        do j = 1, nx2
-          do i = 1, nx1
-            slice_interp(i,j) = (1.0_rk - alpha) * global_slice0(i,j) + alpha * global_slice1(i,j)
-          end do
-        end do
-
-        fname = trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))// &
-                '_SL_'//trim(f_)//'_'//ax//'='//trim(real2string(slice_coord))//'.csv'
-
-        call writeslice(nx1, nx2, trim(fname), slice_interp)
+        write(msg,'(A, I0, A, I0, A, ES12.4)') 'Slice ',isl,'/',nslice,', '//ax//' = ',slice_
+        call message(trim(msg))
       end if
 
-      call MPI_Barrier(MPI_COMM_WORLD, ierr)
+      ! Wipe clean slice arrays
+      local_slice0 = 0.0_rk; local_slice1 = 0.0_rk
+      global_slice0 = 0.0_rk; global_slice1 = 0.0_rk
+      slice_interp = 0.0_rk
 
-    end do  ! time loop
+      ! Compute bracketing indices for z
+      call find_bracket_uniform(nax, Lax, slice_, k0, k1, alpha)
+      if (myrank == 0) then
+        write(msg,'(A, I0, A, I0, A, ES12.4)')'k0 = ',k0,', k1 = ',k1,', alpha = ',alpha
+        call message(trim(msg))
+      end if
+
+      ! Loop over time snapshots
+      do k = 1, size(sorted_keys)
+
+        ! 1) Read 3D field for this time step on each rank
+        if(mode == 0)then
+          fname = 'Run'//trim(rc)//'_'//trim(f_)//'_t'//trim(sorted_keys(k))//'.out'
+        else if(mode == 1)then          
+          fname = 'Run'//trim(rc)//'_budget'//budget//'_term'//term//'_t'//&
+              trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D'
+        end if
+        f1 = reader%read_field(trim(path)//'/'//trim(fname))
+
+        ! 2) Build local contributions to the two bracketing planes
+        local_slice0 = 0.0_rk
+        local_slice1 = 0.0_rk
+
+        block
+          logical :: has0, has1
+          integer :: k0_loc, k1_loc
+
+          has0 = (k0 >= axs .and. k0 <= axe)
+          has1 = (k1 >= axs .and. k1 <= axe)
+
+          if (has0) then
+            k0_loc = k0 - axs + 1
+            select case(ax)
+            case('x')
+              slice_ptr => f1(k0_loc,:,:)
+            case('y')
+              slice_ptr => f1(:,k0_loc,:)
+            case('z')
+              slice_ptr => f1(:,:,k0_loc)
+            end select
+            local_slice0(x1s:x1e, x2s:x2e) = slice_ptr(:,:)
+          end if
+
+          if (has1) then
+            k1_loc = k1 - axs + 1
+            select case(ax)
+            case('x')
+              slice_ptr => f1(k1_loc,:,:)
+            case('y')
+              slice_ptr => f1(:,k1_loc,:)
+            case('z')
+              slice_ptr => f1(:,:,k1_loc)
+            end select
+            local_slice1(x1s:x1e, x2s:x2e) = slice_ptr(:,:)
+          end if
+        end block
+
+        ! 3) Sum contributions from all ranks to get full global slices
+        call MPI_Allreduce(local_slice0, global_slice0, nx1*nx2, MPI_DOUBLE_PRECISION, &
+                          MPI_SUM, MPI_COMM_WORLD, ierr)
+        call MPI_Allreduce(local_slice1, global_slice1, nx1*nx2, MPI_DOUBLE_PRECISION, &
+                          MPI_SUM, MPI_COMM_WORLD, ierr)
+
+        ! 4) On root: do linear interpolation and write CSV
+        if (myrank == 0) then
+          do j = 1, nx2
+            do i = 1, nx1
+              slice_interp(i,j) = (1.0_rk - alpha) * global_slice0(i,j) + alpha * global_slice1(i,j)
+            end do
+          end do
+
+          ! Output file name
+          fname = trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//&
+                    '_SL_'//trim(f_)//'_'//ax
+          if(slice_ <= -1) fname = trim(fname)//'_'//eax ! A direct index is given
+          fname = trim(fname)//'='//trim(real2string(slice_))//'.csv'
+          
+          call writeslice(nx1, nx2, trim(fname), slice_interp)
+        end if
+
+        call MPI_Barrier(MPI_COMM_WORLD, ierr)
+
+      end do  ! time loop
+    end do
 
     ! Cleanup
     if (allocated(f1))           deallocate(f1)
@@ -491,15 +525,29 @@ contains
   end subroutine slice_driver
 
   pure function real2string(z) result(tag)
-    ! Convert slice coordinate (e.g. 0.25) to a compact string "0p25"
-    ! Unnecessary trailing zeros are removed:
-    !   0.250  -> "0p25"
-    !   1.000  -> "1"
+    ! Convert slice coordinate to a compact string.
+    ! Modes:
+    !   z >= 0.0  : treated as a physical location, e.g.
+    !               0.250  -> "0p25"
+    !               1.000  -> "1"
+    !   z  < 0.0  : treated as an index flag, e.g.
+    !               -2.0   -> "2"   (level 2)
 
     real(rk), intent(in) :: z
     character(len=32)    :: tag
+
     character(len=64) :: tmp
-    integer :: i, n
+    integer :: i, n, idx
+
+    ! --- Index mode for negative values ---
+    if (z < 0.0_rk) then
+      idx = nint(-z)                  ! -2.0 -> 2, -2.3 -> 2 (round to nearest)
+      write(tag, '(I0)') idx
+      if (len_trim(tag) < len(tag)) tag(len_trim(tag)+1:) = ' '
+      return
+    end if
+
+    ! --- Original behaviour for non-negative values ---
 
     ! 1) Write with fixed decimals (adjust precision as you like)
     write(tmp, '(F15.8)') z      ! e.g. "      0.25000000"
@@ -532,6 +580,7 @@ contains
       tag = tmp(1:n)
       if (n < len(tag)) tag(n+1:) = ' '
     end if
+
   end function real2string
 
   ! Utility function to convert character to lower case
@@ -574,12 +623,36 @@ contains
     select case (field)
     case ('u'); name = 'uVel'
     case ('v'); name = 'vVel'
+    case ('w'); name = 'wVel'
     case ('T'); name = 'potT'
     case ('p'); name = 'prss'
     case ('S'); name = 'uVel'
     case default; name = 'uVel'
     end select
   end function field_to_name
+
+  function field_mode(field) result(mode)
+    character(len=*), intent(in) :: field
+    integer            :: mode
+    select case (field)
+    case ('u', 'v', 'w', 'T', 'p'); mode = 0
+    case default; mode = 1
+    end select
+  end function field_mode
+
+  ! Utility function to get proper budget name
+  subroutine define_budget(field, b, t)
+    character(*), intent(in) :: field
+    character(1), intent(out) :: b
+    character(2), intent(out) :: t
+    if(trim(field) == 'ubar')then
+      b = '0'; t = '01'
+    elseif(trim(field) == 'vbar')then
+      b = '0'; t = '02'
+    elseif(trim(field) == 'wbar')then
+      b = '0'; t = '03'
+    end if
+  end subroutine define_budget
 
   ! Utility function to convert integers or reals to strings
   pure function to_string(i) result(str)
@@ -668,6 +741,14 @@ contains
     if (n <= 1) then
       k0    = 1
       k1    = 1
+      alpha = 0.0_rk
+      return
+    end if
+
+    if (z0 <= -1)then
+      ! A direct index is provided
+      k0 = int(abs(z0))
+      k1 = k0
       alpha = 0.0_rk
       return
     end if
@@ -881,6 +962,184 @@ contains
     end if
   end subroutine list_matching_keys
 
+  subroutine list_matching_keys_budget(dir, pattern, keys, stamps)
+    ! Variant of list_matching_keys to handle files like:
+    !   Run06_budget0_term13_t*_n~.s3D
+    !
+    ! where:
+    !   *  -> time stamp (returned in KEYS)
+    !   ~  -> 6-digit stamp (returned in STAMPS)
+    !
+    ! Example filenames:
+    !   Run06_budget0_term13_t000900_n123456.s3D
+    !   Run06_budget0_term13_t001050_n654321.s3D
+    !
+    ! Result:
+    !   keys   = ["000900","001050",...]
+    !   stamps = ["123456","654321",...]
+    !
+    character(*), intent(in) :: dir
+    character(*), intent(in) :: pattern
+    character(len=:), allocatable, intent(out) :: keys(:)
+    character(len=:), allocatable, intent(out) :: stamps(:)
+
+    character(len=:), allocatable :: pre, suf
+    character(len=:), allocatable :: d_esc, p_glob, tmpfile, cmd
+    character(len=4096) :: line
+    integer :: istat, u, nlines, maxlen_k, maxlen_s, klen
+    integer :: ts, lp, pos_n, extpos
+    logical :: ok, ex
+
+    ! Default empty result
+    allocate(keys(0),   mold='     ')
+    allocate(stamps(0), mold='     ')
+
+    ! Split pattern around the single '*' to get prefix PRE (up to 't')
+    call split_one_star(pattern, pre, suf, ok)
+    if (.not. ok) then
+      ! either no '*' or more than one '*'
+      return
+    end if
+
+    ! Escape directory name
+    d_esc  = escape_single_quotes(trim(dir))
+
+    ! Build a glob pattern for 'find':
+    !   original:  Run06_budget0_term13_t*_n~.s3D
+    !   glob:      Run06_budget0_term13_t*_n*.s3D
+    !
+    ! i.e. replace '~' with '*' so we ignore the 6-digit stamp in the shell.
+    block
+      integer :: i, L
+      character(len=:), allocatable :: tmp
+      L = len_trim(pattern)
+      allocate(character(len=L) :: tmp)
+      tmp = pattern
+      do i = 1, L
+        if (tmp(i:i) == '~') tmp(i:i) = '*'
+      end do
+      p_glob = escape_single_quotes(trim(tmp))
+    end block
+
+    tmpfile = '/tmp/fortran_glob_'//to_string(getpid())//'_keys.txt'
+
+    cmd = "find '"//d_esc//"' -maxdepth 1 -type f -name '"//p_glob// &
+          "' -printf '%f\n' > '"//tmpfile//"' 2>/dev/null"
+    call execute_command_line(cmd, exitstat=istat)
+    if (istat /= 0) return
+
+    inquire(file=tmpfile, exist=ex); if (.not. ex) return
+
+    ! Count matches first
+    nlines = 0
+    open(newunit=u, file=tmpfile, status='old', action='read', iostat=istat)
+    if (istat /= 0) return
+    do
+      read(u,'(A)', iostat=istat) line
+      if (istat /= 0) exit
+      nlines = nlines + 1
+    end do
+    close(u)
+
+    if (nlines == 0) then
+      call execute_command_line("rm -f '"//tmpfile//"'", exitstat=istat)
+      return
+    end if
+
+    ! Temp store (over-allocated), we'll dedupe then shrink
+    if (allocated(keys))   deallocate(keys)
+    if (allocated(stamps)) deallocate(stamps)
+    allocate(character(len=1024) :: keys(nlines))
+    allocate(character(len=1024) :: stamps(nlines))
+    klen      = 0
+    maxlen_k  = 0
+    maxlen_s  = 0
+
+    open(newunit=u, file=tmpfile, status='old', action='read', iostat=istat)
+    if (istat /= 0) then
+      deallocate(keys);   allocate(keys(0),   mold='     ')
+      deallocate(stamps); allocate(stamps(0), mold='     ')
+      call execute_command_line("rm -f '"//tmpfile//"'", exitstat=istat)
+      return
+    end if
+
+    lp = len_trim(pre)
+
+    do
+      read(u,'(A)', iostat=istat) line
+      if (istat /= 0) exit
+      ts = len_trim(line)
+      if (ts <= 0) cycle
+
+      ! Must start with PRE (e.g. "Run06_budget0_term13_t")
+      if (.not. starts_with(line(:ts), pre)) cycle
+
+      ! Find the "_n" that comes after the timestamp
+      pos_n = index(line(:ts), '_n')
+      if (pos_n <= 0) cycle   ! no "_n" -> not our file
+
+      ! Check extension ".s3D"
+      if (ts < 4) cycle
+      extpos = ts - 3          ! position of '.' in ".s3D"
+      if (line(extpos:ts) /= '.s3D') cycle
+
+      ! Extract timestamp between PRE and "_n"
+      if (pos_n <= lp+1) cycle   ! nothing between prefix and "_n"
+      ! time stamp (*)
+      block
+        character(len=1024) :: tstamp, sstamp
+        integer :: lt, ls
+
+        tstamp = line(lp+1 : pos_n-1)
+
+        ! Extract the 6-digit stamp (~) between "n" and ".s3D"
+        ! line: "..._n123456.s3D"
+        ! pos_n: index of "_"
+        ! 'n' is pos_n+1, stamp starts at pos_n+2, ends at extpos-1
+        if (extpos <= pos_n+2) cycle
+        sstamp = line(pos_n+2 : extpos-1)
+
+        ! Deduplicate based on time stamp; if same time stamp appears twice
+        ! we'll ignore duplicates (assuming 1-to-1 as you said).
+        if (.not. in_list(keys, klen, trim(tstamp))) then
+          klen = klen + 1
+          keys(klen)   = trim(tstamp)
+          stamps(klen) = trim(sstamp)
+          lt = len_trim(tstamp)
+          ls = len_trim(sstamp)
+          maxlen_k = max(maxlen_k, lt)
+          maxlen_s = max(maxlen_s, ls)
+        end if
+      end block
+    end do
+
+    close(u)
+    call execute_command_line("rm -f '"//tmpfile//"'", exitstat=istat)
+
+    ! Resize KEYS and STAMPS to exactly klen and appropriate lengths
+    if (klen == 0) then
+      deallocate(keys);   allocate(keys(0),   mold='     ')
+      deallocate(stamps); allocate(stamps(0), mold='     ')
+    else
+      block
+        character(len=:), allocatable :: tmpk(:), tmps(:)
+        integer :: j
+
+        allocate(character(len=maxlen_k) :: tmpk(klen))
+        allocate(character(len=maxlen_s) :: tmps(klen))
+
+        do j = 1, klen
+          tmpk(j) = adjustl(keys(j)(:maxlen_k))
+          tmps(j) = adjustl(stamps(j)(:maxlen_s))
+        end do
+
+        call move_alloc(tmpk, keys)
+        call move_alloc(tmps, stamps)
+      end block
+    end if
+
+  end subroutine list_matching_keys_budget
+
   subroutine list_matching_filenames(dir, pattern, names)
     ! Return array of filenames (no path) in DIR matching PATTERN (e.g., Run01_uVel_t*.out)
     character(*), intent(in) :: dir
@@ -1022,6 +1281,82 @@ contains
     end do
   end function sort_keys_numeric
 
+  subroutine sort_keys_and_stamps_numeric(keys, stamps, sorted_keys, sorted_stamps)
+    !! Sort KEYS (time stamps) by their integer value (ascending),
+    !! and apply the same ordering to STAMPS.
+    !!
+    !! Input:
+    !!   keys(:)   - character time stamps, e.g. "000900", "001050"
+    !!   stamps(:) - corresponding "~" stamps, e.g. "123456", "654321"
+    !!
+    !! Output (allocatable):
+    !!   sorted_keys(:), sorted_stamps(:) - reordered copies
+    !!
+    character(len=*), intent(in)  :: keys(:)
+    character(len=*), intent(in)  :: stamps(:)
+    character(len=:), allocatable, intent(out) :: sorted_keys(:)
+    character(len=:), allocatable, intent(out) :: sorted_stamps(:)
+
+    integer :: n, i, j, ios, val
+    integer, allocatable :: vals(:), idx(:)
+    integer :: maxlen_k, maxlen_s
+    character(len=:), allocatable :: s
+
+    ! Basic checks
+    n = size(keys)
+    if (n == 0 .or. size(stamps) /= n) then
+      allocate(character(len=1) :: sorted_keys(0))
+      allocate(character(len=1) :: sorted_stamps(0))
+      return
+    end if
+
+    allocate(vals(n), idx(n))
+
+    ! Parse integers from KEYS; non-numeric => sent to the end
+    do i = 1, n
+      s = trim(keys(i))
+      read(s, *, iostat=ios) val
+      if (ios == 0) then
+        vals(i) = val
+      else
+        vals(i) = huge(1)    ! put non-numeric keys after numeric ones
+      end if
+      idx(i) = i
+    end do
+
+    ! Simple O(n^2) indirect sort of idx by vals
+    do i = 1, n-1
+      do j = i+1, n
+        if (vals(idx(j)) < vals(idx(i))) then
+          call swap(idx(i), idx(j))   ! your existing swap(int,int)
+        end if
+      end do
+    end do
+
+    ! Decide output lengths
+    maxlen_k = 0
+    maxlen_s = 0
+    do i = 1, n
+      maxlen_k = max(maxlen_k, len_trim(keys(i)))
+      maxlen_s = max(maxlen_s, len_trim(stamps(i)))
+    end do
+    if (maxlen_k <= 0) maxlen_k = 1
+    if (maxlen_s <= 0) maxlen_s = 1
+
+    ! Allocate outputs with trimmed lengths
+    allocate(character(len=maxlen_k) :: sorted_keys(n))
+    allocate(character(len=maxlen_s) :: sorted_stamps(n))
+
+    ! Fill outputs according to permutation idx
+    do i = 1, n
+      sorted_keys(i)   = adjustl(keys(idx(i))(1:maxlen_k))
+      sorted_stamps(i) = adjustl(stamps(idx(i))(1:maxlen_s))
+    end do
+
+    deallocate(vals, idx)
+
+  end subroutine sort_keys_and_stamps_numeric
+
   ! Simple integer swap
   pure subroutine swap(a, b)
     integer, intent(inout) :: a, b
@@ -1040,14 +1375,15 @@ program MPIR3D_
   integer :: ierr
   character(len=256) :: path, outdir
   character(len=10) :: field
-  integer:: nx=1, ny=1, nz=1, runid=1, taskid=0
+  integer:: nx=1, ny=1, nz=1, runid=1, taskid=0, num_slice=1
   real(rk):: Lx=1.0_rk, Ly=1.0_rk, Lz=1.0_rk
   integer :: nlen, ioUnit=28
   character(:), allocatable :: inputfile
   character(len=1) :: slice_axis = 'z'
-  real(rk) :: slice_coord = 0.0_rk
+  real(rk) :: slice_coord(1000)
+  real(rk), allocatable :: slice_coord_(:)
   namelist /SETUP/ nx, ny, nz, Lx, Ly, Lz, path, outdir, runid, taskid, field, &
-                   slice_axis, slice_coord
+                   slice_axis, num_slice, slice_coord
       
   ! Initiate MPI
   ! -------------------------------------------------------------------------!
@@ -1071,6 +1407,11 @@ program MPIR3D_
   open(unit=ioUnit, file=trim(inputfile), form='FORMATTED', iostat=ierr)
   read(unit=ioUnit, NML=SETUP)
   close(ioUnit)
+  if (taskid == 1)then
+    if(allocated(slice_coord_))deallocate(slice_coord_)
+    allocate(slice_coord_(num_slice))
+    slice_coord_ = slice_coord(1:num_slice)
+  end if
 
   ! Initiate reader
   call reader%init(nx, ny, nz)
@@ -1080,7 +1421,8 @@ program MPIR3D_
     call ha_driver(reader, Lz, runid, path, outdir, field)
   else if (taskid == 1) then
     ! Slice
-    call slice_driver(reader, Lx, Ly, Lz, runid, path, outdir, field, slice_axis, slice_coord)
+    call slice_driver(reader, Lx, Ly, Lz, runid, path, outdir, field, slice_axis, &
+      num_slice, slice_coord_)
   end if
   
   if(myrank == 0) call message('Wrapping up ...')
