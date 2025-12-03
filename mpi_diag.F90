@@ -298,15 +298,15 @@ contains
 
           f2 = reader%read_field(trim(path)//'/'//'Run'//trim(rc)//'_vVel_t'//trim(sorted_keys(k))//'.out')  
           call do_horizontal_average_ws_wd(nz, nxloc, nyloc, nzloc, zs, f1, f2, ws, wd)
-          call csvprofile(nz,trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//'HA_WS.csv',z,ws)
-          call csvprofile(nz,trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//'HA_WD.csv',z,wd)
+          call csvprofile(nz,trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//'_HA_WS.csv',z,ws)
+          call csvprofile(nz,trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//'_HA_WD.csv',z,wd)
         end block
       else
         block
           real(rk) :: profile(nz)
           call do_horizontal_average(nz, nxloc, nyloc, nzloc, zs, f1, profile)
           call csvprofile(nz, trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//&
-                'HA_'//trim(f_)//'.csv',z,profile)
+                '_HA_'//trim(f_)//'.csv',z,profile)
         end block
       end if
     end do
@@ -337,6 +337,7 @@ contains
     character(len=10) :: f_
     character(len=1) :: ax, x1name, x2name, budget, eax
     character(len=256) :: fname, msg
+    character(len=2048) :: pattern
 
     ! Time keys
     character(len=:), allocatable :: keys(:), sorted_keys(:), stamps(:), sorted_stamps(:)
@@ -377,8 +378,13 @@ contains
     else
       f_ = trim(field)
       call define_budget(trim(field), budget, term) 
-      call list_matching_keys_budget(trim(path), &
-        'Run'//trim(rc)//'_budget'//budget//'_term'//term//'_t*_n~.s3D', keys, stamps)
+      pattern = 'Run'//trim(rc)
+      if (mode == 2) pattern = trim(pattern)//'_deficit'
+      pattern = trim(pattern)//'_budget'//budget//'_term'//term//'_t*_n~.s3D'
+      if (myrank == 0)then
+        call message('Pattern is '//trim(pattern))
+      end if
+      call list_matching_keys_budget(trim(path), trim(pattern), keys, stamps)
       call sort_keys_and_stamps_numeric(keys, stamps, sorted_keys, sorted_stamps)
     end if    
 
@@ -443,6 +449,9 @@ contains
           fname = 'Run'//trim(rc)//'_'//trim(f_)//'_t'//trim(sorted_keys(k))//'.out'
         else if(mode == 1)then          
           fname = 'Run'//trim(rc)//'_budget'//budget//'_term'//term//'_t'//&
+              trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D'
+        else if(mode == 2)then          
+          fname = 'Run'//trim(rc)//'_deficit_budget'//budget//'_term'//term//'_t'//&
               trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D'
         end if
         f1 = reader%read_field(trim(path)//'/'//trim(fname))
@@ -634,8 +643,11 @@ contains
   function field_mode(field) result(mode)
     character(len=*), intent(in) :: field
     integer            :: mode
-    select case (field)
+    select case (trim(field))
     case ('u', 'v', 'w', 'T', 'p'); mode = 0
+    case ('delta_u', 'delta_v', 'delta_w', &
+          'dup_dup','dvp_dvp','dwp_dwp',   &
+          'dup_bup','dvp_bvp','dwp_bwp'); mode = 2
     case default; mode = 1
     end select
   end function field_mode
@@ -651,6 +663,30 @@ contains
       b = '0'; t = '02'
     elseif(trim(field) == 'wbar')then
       b = '0'; t = '03'
+    elseif(trim(field) == 'delta_u')then
+      b = '0'; t = '01'
+    elseif(trim(field) == 'delta_v')then
+      b = '0'; t = '02'
+    elseif(trim(field) == 'delta_w')then
+      b = '0'; t = '03'
+    elseif(trim(field) == 'dup_dup')then
+      b = '0'; t = '05'
+    elseif(trim(field) == 'dvp_dvp')then
+      b = '0'; t = '08'
+    elseif(trim(field) == 'dwp_dwp')then
+      b = '0'; t = '10'
+    elseif(trim(field) == 'dup_bup')then
+      b = '0'; t = '11'
+    elseif(trim(field) == 'dvp_bvp')then
+      b = '0'; t = '16'
+    elseif(trim(field) == 'dwp_bwp')then
+      b = '0'; t = '19'
+    elseif(trim(field) == 'R11')then
+      b = '0'; t = '04'
+    elseif(trim(field) == 'R22')then
+      b = '0'; t = '07'
+    elseif(trim(field) == 'R33')then
+      b = '0'; t = '09'
     end if
   end subroutine define_budget
 
