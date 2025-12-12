@@ -647,7 +647,8 @@ contains
     case ('u', 'v', 'w', 'T', 'p'); mode = 0
     case ('delta_u', 'delta_v', 'delta_w', &
           'dup_dup','dvp_dvp','dwp_dwp',   &
-          'dup_bup','dvp_bvp','dwp_bwp'); mode = 2
+          'dup_bup','dvp_bvp','dwp_bwp', &
+          'delta_p'); mode = 2
     case default; mode = 1
     end select
   end function field_mode
@@ -687,6 +688,8 @@ contains
       b = '0'; t = '07'
     elseif(trim(field) == 'R33')then
       b = '0'; t = '09'
+    elseif(trim(field) == 'delta_p')then
+      b = '0'; t = '04'
     end if
   end subroutine define_budget
 
