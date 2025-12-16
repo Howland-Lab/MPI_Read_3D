@@ -259,10 +259,14 @@ contains
     character(*), intent(in) :: path, outdir, field
     real(rk), intent(in) :: Lz
     real(rk), allocatable :: f1(:,:,:), z(:)
-    character(len=:), allocatable :: keys(:), sorted_keys(:)
-    character(len=2) :: rc
+    character(len=:), allocatable :: keys(:), sorted_keys(:), stamps(:), sorted_stamps(:)
+    character(len=2) :: rc, term
     character(len=10):: f_
     integer :: k, nx, ny, nz, xs, xe, ys, ye, zs, ze, nxloc, nyloc, nzloc
+    integer:: mode
+    character(len=1) :: budget
+    character(len=2048) :: pattern
+    character(len=256) :: fname
 
     ! Fetch local and global sizes & start indices
     call reader%local_shape(nxloc, nyloc, nzloc)
@@ -275,23 +279,45 @@ contains
     ! Convert runid to character
     write(rc, '(I2.2)') runid
 
-    ! Convert field name to proper string
-    f_ = field_to_name(trim(field))
-
     ! Vertical coordinate z
-    z = linspace(0.0_rk, Lz, nz)   
+    z = linspace(0.0_rk, Lz, nz)  
 
-    ! List files matching pattern
-    call list_matching_keys(trim(path), 'Run'//trim(rc)//'_'//trim(f_)//'_t*.out', keys)
-    
-    ! Sort keys in time order (numeric)
-    sorted_keys = sort_keys_numeric(keys)
+    mode = field_mode(trim(field))
+    if(mode == 0)then
+      ! Convert field name to proper string
+      f_ = field_to_name(trim(field))
+      call list_matching_keys(trim(path), 'Run'//trim(rc)//'_'//trim(f_)//'_t*.out', keys)
+      sorted_keys = sort_keys_numeric(keys)
+    else
+      f_ = trim(field)
+      call define_budget(trim(field), budget, term) 
+      pattern = 'Run'//trim(rc)
+      if (mode == 2) pattern = trim(pattern)//'_deficit'
+      pattern = trim(pattern)//'_budget'//budget//'_term'//term//'_t*_n~.s3D'
+      if (myrank == 0)then
+        call message('Pattern is '//trim(pattern))
+      end if
+      call list_matching_keys_budget(trim(path), trim(pattern), keys, stamps)
+      call sort_keys_and_stamps_numeric(keys, stamps, sorted_keys, sorted_stamps)
+    end if
 
     do k = 1, size(sorted_keys)
 
+      if(mode == 0)then
+          fname = 'Run'//trim(rc)//'_'//trim(f_)//'_t'//trim(sorted_keys(k))//'.out'
+        else if(mode == 1)then          
+          fname = 'Run'//trim(rc)//'_budget'//budget//'_term'//term//'_t'//&
+              trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D'
+        else if(mode == 2)then          
+          fname = 'Run'//trim(rc)//'_deficit_budget'//budget//'_term'//term//'_t'//&
+              trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D'
+        end if      
+
       ! If it is a single field, only f1 is read
       ! for WS and WD profiles, another field f2 (vVel) is also read
-      f1 = reader%read_field(trim(path)//'/'//'Run'//trim(rc)//'_'//trim(f_)//'_t'//trim(sorted_keys(k))//'.out')
+      ! f1 = reader%read_field(trim(path)//'/'//'Run'//trim(rc)//'_'//trim(f_)//'_t'//trim(sorted_keys(k))//'.out')
+      f1 = reader%read_field(trim(path)//'/'//trim(fname))
+
       if (field == 'S') then
         block
           real(rk) :: f2(nxloc, nyloc, nzloc), ws(nz), wd(nz)
@@ -664,6 +690,8 @@ contains
       b = '0'; t = '02'
     elseif(trim(field) == 'wbar')then
       b = '0'; t = '03'
+    elseif(trim(field) == 'pbar')then
+      b = '0'; t = '10'
     elseif(trim(field) == 'delta_u')then
       b = '0'; t = '01'
     elseif(trim(field) == 'delta_v')then
