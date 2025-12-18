@@ -360,7 +360,7 @@ contains
     integer :: k, k0, k1
     real(rk) :: alpha
     character(len=2) :: rc, term
-    character(len=10) :: f_
+    character(len=256) :: f_
     character(len=1) :: ax, x1name, x2name, budget, eax
     character(len=256) :: fname, msg
     character(len=2048) :: pattern
@@ -674,7 +674,10 @@ contains
     case ('delta_u', 'delta_v', 'delta_w', &
           'dup_dup','dvp_dvp','dwp_dwp',   &
           'dup_bup','dvp_bvp','dwp_bwp', &
-          'delta_p'); mode = 2
+          'delta_p', &
+          'adv_base_delta_u','adv_base_delta_v','adv_base_delta_w',&
+          'adv_delta_delta_u','adv_delta_delta_v','adv_delta_delta_w',&
+          'adv_delta_base_u','adv_delta_base_v','adv_delta_base_w'); mode = 2
     case default; mode = 1
     end select
   end function field_mode
@@ -718,6 +721,26 @@ contains
       b = '0'; t = '09'
     elseif(trim(field) == 'delta_p')then
       b = '0'; t = '04'
+    elseif(trim(field) == 'adv_base_delta_u')then
+      b = '1'; t = '02'
+    elseif(trim(field) == 'adv_delta_delta_u')then
+      b = '1'; t = '03'
+    elseif(trim(field) == 'adv_delta_base_u')then
+      b = '1'; t = '04'
+    elseif(trim(field) == 'adv_base_delta_v')then
+      b = '1'; t = '12'
+    elseif(trim(field) == 'adv_delta_delta_v')then
+      b = '1'; t = '13'
+    elseif(trim(field) == 'adv_delta_base_v')then
+      b = '1'; t = '14'
+    elseif(trim(field) == 'adv_base_delta_w')then
+      b = '1'; t = '22'
+    elseif(trim(field) == 'adv_delta_delta_w')then
+      b = '1'; t = '23'
+    elseif(trim(field) == 'adv_delta_base_w')then
+      b = '1'; t = '24'
+    elseif(trim(field) == 'adv_u')then
+      b = '1'; t = '01'
     end if
   end subroutine define_budget
 
@@ -1441,7 +1464,7 @@ program MPIR3D_
   type(FieldReader2Decomp) :: reader
   integer :: ierr
   character(len=256) :: path, outdir
-  character(len=10) :: field
+  character(len=256) :: field
   integer:: nx=1, ny=1, nz=1, runid=1, taskid=0, num_slice=1
   real(rk):: Lx=1.0_rk, Ly=1.0_rk, Lz=1.0_rk
   integer :: nlen, ioUnit=28
@@ -1485,11 +1508,11 @@ program MPIR3D_
 
   if (taskid == 0)then
     ! Horizontal average
-    call ha_driver(reader, Lz, runid, path, outdir, field)
+    call ha_driver(reader, Lz, runid, trim(path), trim(outdir), trim(field))
   else if (taskid == 1) then
     ! Slice
-    call slice_driver(reader, Lx, Ly, Lz, runid, path, outdir, field, slice_axis, &
-      num_slice, slice_coord_)
+    call slice_driver(reader, Lx, Ly, Lz, runid, trim(path), trim(outdir), trim(field), &
+      slice_axis, num_slice, slice_coord_)
   end if
   
   if(myrank == 0) call message('Wrapping up ...')
