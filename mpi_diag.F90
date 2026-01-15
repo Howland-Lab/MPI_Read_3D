@@ -15,6 +15,11 @@ module MPIR3D
   integer :: myrank = -1
   integer :: nprocs = -1
 
+  interface to_string
+    module procedure to_string_int
+    module procedure to_string_real
+  end interface to_string
+
   type :: FieldReader2Decomp
      private
      ! Global sizes and process grid
@@ -95,6 +100,7 @@ contains
 
     if (myrank == 0) then
       call message('FRD_INIT: 2DECOMP reader initialized.')
+      call message(' ')
     end if
 
     call mpi_barrier(MPI_COMM_WORLD, ierr)
@@ -253,20 +259,18 @@ contains
     end do
   end subroutine do_horizontal_average
   
-  subroutine ha_driver(reader, Lz, runid, path, outdir, field)
+  subroutine ha_driver(reader, Lz, runid, path, outdir, field, budget_source)
     class(FieldReader2Decomp), intent(inout) :: reader
     integer, intent(in) :: runid
     character(*), intent(in) :: path, outdir, field
-    real(rk), intent(in) :: Lz
+    integer,          intent(in)  :: budget_source
+    real(rk), intent(in) :: Lz    
     real(rk), allocatable :: f1(:,:,:), z(:)
-    character(len=:), allocatable :: keys(:), sorted_keys(:), stamps(:), sorted_stamps(:)
-    character(len=2) :: rc, term
-    character(len=10):: f_
+    character(len=:), allocatable :: sorted_keys(:), sorted_stamps(:)
+    character(len=2) :: rc
+    character(len=256):: f_
     integer :: k, nx, ny, nz, xs, xe, ys, ye, zs, ze, nxloc, nyloc, nzloc
-    integer:: mode
-    character(len=1) :: budget
-    character(len=2048) :: pattern
-    character(len=256) :: fname
+    logical :: calc=.false.
 
     ! Fetch local and global sizes & start indices
     call reader%local_shape(nxloc, nyloc, nzloc)
@@ -282,41 +286,13 @@ contains
     ! Vertical coordinate z
     z = linspace(0.0_rk, Lz, nz)  
 
-    mode = field_mode(trim(field))
-    if(mode == 0)then
-      ! Convert field name to proper string
-      f_ = field_to_name(trim(field))
-      call list_matching_keys(trim(path), 'Run'//trim(rc)//'_'//trim(f_)//'_t*.out', keys)
-      sorted_keys = sort_keys_numeric(keys)
-    else
-      f_ = trim(field)
-      call define_budget(trim(field), budget, term) 
-      pattern = 'Run'//trim(rc)
-      if (mode == 2) pattern = trim(pattern)//'_deficit'
-      pattern = trim(pattern)//'_budget'//budget//'_term'//term//'_t*_n~.s3D'
-      if (myrank == 0)then
-        call message('Pattern is '//trim(pattern))
-      end if
-      call list_matching_keys_budget(trim(path), trim(pattern), keys, stamps)
-      call sort_keys_and_stamps_numeric(keys, stamps, sorted_keys, sorted_stamps)
-    end if
-
+    ! Get file list and sort by time
+    call get_keys_stamps(trim(path), trim(rc), budget_source, trim(field), f_, sorted_keys, sorted_stamps, calc)
+    
     do k = 1, size(sorted_keys)
 
-      if(mode == 0)then
-          fname = 'Run'//trim(rc)//'_'//trim(f_)//'_t'//trim(sorted_keys(k))//'.out'
-        else if(mode == 1)then          
-          fname = 'Run'//trim(rc)//'_budget'//budget//'_term'//term//'_t'//&
-              trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D'
-        else if(mode == 2)then          
-          fname = 'Run'//trim(rc)//'_deficit_budget'//budget//'_term'//term//'_t'//&
-              trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D'
-        end if      
-
-      ! If it is a single field, only f1 is read
-      ! for WS and WD profiles, another field f2 (vVel) is also read
-      ! f1 = reader%read_field(trim(path)//'/'//'Run'//trim(rc)//'_'//trim(f_)//'_t'//trim(sorted_keys(k))//'.out')
-      f1 = reader%read_field(trim(path)//'/'//trim(fname))
+      call eval_field(reader, budget_source, calc, trim(path), trim(path), trim(rc), trim(rc), &
+          trim(field), trim(f_), trim(sorted_keys(k)), trim(sorted_stamps(k)), f1)
 
       if (field == 'S') then
         block
@@ -338,11 +314,12 @@ contains
     end do
   end subroutine ha_driver
 
-  subroutine slice_driver(reader, Lx, Ly, Lz, runid, path, outdir, field, axis, nslice, slice_coord)
+  subroutine slice_driver(reader, Lx, Ly, Lz, runid, path, outdir, field, axis, nslice, slice_coord, budget_source)
     class(FieldReader2Decomp), intent(inout) :: reader
     integer,          intent(in)  :: runid, nslice
     character(*),     intent(in)  :: path, outdir, field
     real(rk),         intent(in)  :: Lx, Ly, Lz, slice_coord(nslice)
+    integer,          intent(in)  :: budget_source
     character(*),     intent(in)  :: axis   ! e.g. 'z'
 
     ! Local 3D field
@@ -354,19 +331,18 @@ contains
     integer :: xs, xe, ys, ye, zs, ze
 
     ! Global coordinates
-    real(rk), allocatable :: x1(:), x2(:)
+    ! real(rk), allocatable :: x1(:), x2(:)
 
     ! Slice indices and interpolation
     integer :: k, k0, k1
     real(rk) :: alpha
-    character(len=2) :: rc, term
+    character(len=2) :: rc
     character(len=256) :: f_
-    character(len=1) :: ax, x1name, x2name, budget, eax
+    character(len=1) :: ax, x1name, x2name, eax
     character(len=256) :: fname, msg
-    character(len=2048) :: pattern
 
     ! Time keys
-    character(len=:), allocatable :: keys(:), sorted_keys(:), stamps(:), sorted_stamps(:)
+    character(len=:), allocatable :: sorted_keys(:), sorted_stamps(:)
 
     ! Slice arrays (global shape on every rank)
     real(rk), allocatable :: local_slice0(:,:), local_slice1(:,:)
@@ -374,8 +350,9 @@ contains
     real(rk), pointer :: slice_ptr(:,:)
 
     integer :: i, j, isl, ierr, nx1, nx2, nax
-    integer :: x1s, x1e, x2s, x2e, axs, axe, mode
+    integer :: x1s, x1e, x2s, x2e, axs, axe
     real(rk) :: L1, L2, Lax, slice_
+    logical :: calc=.false.
 
     ! Handling reference to wind speed and wind direction
     if(trim(field) == 'S')then
@@ -396,24 +373,8 @@ contains
     allocate(f1(nxloc, nyloc, nzloc))
 
     ! Get file list and sort by time
-    mode = field_mode(trim(field))
-    if (mode == 0)then
-      f_ = field_to_name(trim(field))
-      call list_matching_keys(trim(path), 'Run'//trim(rc)//'_'//trim(f_)//'_t*.out', keys)
-      sorted_keys = sort_keys_numeric(keys)
-    else
-      f_ = trim(field)
-      call define_budget(trim(field), budget, term) 
-      pattern = 'Run'//trim(rc)
-      if (mode == 2) pattern = trim(pattern)//'_deficit'
-      pattern = trim(pattern)//'_budget'//budget//'_term'//term//'_t*_n~.s3D'
-      if (myrank == 0)then
-        call message('Pattern is '//trim(pattern))
-      end if
-      call list_matching_keys_budget(trim(path), trim(pattern), keys, stamps)
-      call sort_keys_and_stamps_numeric(keys, stamps, sorted_keys, sorted_stamps)
-    end if    
-
+    call get_keys_stamps(trim(path), trim(rc), budget_source, trim(field), f_, sorted_keys, sorted_stamps, calc)
+    
     ! Figure which coordinate names to use
     select case (ax)
     case ('x')
@@ -438,10 +399,6 @@ contains
       axs = zs; axe = ze
       eax = 'k'
     end select
-
-    ! Global coordinate arrays (same on all ranks)
-    x1 = linspace(0.0_rk, L1, nx1)
-    x2 = linspace(0.0_rk, L2, nx2)
 
     ! Global slice arrays (same shape on all ranks)
     allocate(local_slice0(nx1, nx2), local_slice1(nx1, nx2))
@@ -470,17 +427,8 @@ contains
       ! Loop over time snapshots
       do k = 1, size(sorted_keys)
 
-        ! 1) Read 3D field for this time step on each rank
-        if(mode == 0)then
-          fname = 'Run'//trim(rc)//'_'//trim(f_)//'_t'//trim(sorted_keys(k))//'.out'
-        else if(mode == 1)then          
-          fname = 'Run'//trim(rc)//'_budget'//budget//'_term'//term//'_t'//&
-              trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D'
-        else if(mode == 2)then          
-          fname = 'Run'//trim(rc)//'_deficit_budget'//budget//'_term'//term//'_t'//&
-              trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D'
-        end if
-        f1 = reader%read_field(trim(path)//'/'//trim(fname))
+        call eval_field(reader, budget_source, calc, trim(path), trim(path), trim(rc), trim(rc), &
+          trim(field), trim(f_), trim(sorted_keys(k)), trim(sorted_stamps(k)), f1)
 
         ! 2) Build local contributions to the two bracketing planes
         local_slice0 = 0.0_rk
@@ -539,25 +487,276 @@ contains
                     '_SL_'//trim(f_)//'_'//ax
           if(slice_ <= -1) fname = trim(fname)//'_'//eax ! A direct index is given
           fname = trim(fname)//'='//trim(real2string(slice_))//'.csv'
-          
+
           call writeslice(nx1, nx2, trim(fname), slice_interp)
         end if
 
         call MPI_Barrier(MPI_COMM_WORLD, ierr)
 
+        if(myrank == 0) call message(' ')
       end do  ! time loop
     end do
 
     ! Cleanup
     if (allocated(f1))           deallocate(f1)
-    if (allocated(x1))           deallocate(x1)
-    if (allocated(x2))           deallocate(x2)
     if (allocated(local_slice0)) deallocate(local_slice0)
     if (allocated(local_slice1)) deallocate(local_slice1)
     if (allocated(global_slice0)) deallocate(global_slice0)
     if (allocated(global_slice1)) deallocate(global_slice1)
     if (allocated(slice_interp))  deallocate(slice_interp)
   end subroutine slice_driver
+
+  subroutine miscellaneous_driver(reader, runid, field)
+    implicit none
+    class(FieldReader2Decomp), intent(inout) :: reader
+    integer, intent(in) :: runid
+    character(*), intent(in) :: field
+
+    call verify_budgets(reader, runid, field)
+
+  end subroutine miscellaneous_driver
+
+  subroutine verify_budgets(reader, runid, field)
+    implicit none
+    class(FieldReader2Decomp), intent(inout) :: reader
+    integer, intent(in) :: runid
+    character(*), intent(in) :: field
+    character(len=256) :: path1, path2, field_, f_
+    character(len=2) :: rc, term, term_, rcbase
+    character(len=1) :: budget, budget_
+    integer :: k, ierr, sgn=1
+    real(rk) :: error, global_error
+    real(rk), allocatable :: errors(:)
+
+    ! Grid and indices
+    integer :: nx, ny, nz
+    integer :: nxloc, nyloc, nzloc
+    integer :: xs, xe, ys, ye, zs, ze
+    logical :: calc=.false., calc_= .false.
+
+    ! Time keys
+    character(len=:), allocatable :: sorted_keys(:), sorted_stamps(:)
+
+    ! Local 3D field
+    real(rk), allocatable, target :: f1(:,:,:), fprim(:,:,:), fpre(:,:,:), ferr(:,:,:)
+
+    path1 = '/anvil/scratch/x-kali/PadeOpsSims/NREL5MW-8x5-56x20x8/LR10/test_mini_budgets'
+    path2 = '/anvil/scratch/x-kali/PadeOpsSims/NREL5MW-8x5-56x20x8/LR10/test_mini_budgets/run_orig_deficit_budget'
+
+    ! Convert runid to character
+    write(rc, '(I2.2)') runid
+    write(rcbase, '(I2.2)') (runid-1)
+
+    ! Shapes and local indices
+    call reader%local_shape(nxloc, nyloc, nzloc)
+    call reader%global_shape(nx, ny, nz)
+    call reader%indices(xs, xe, ys, ye, zs, ze)
+
+    ! Allocate local 3D field
+    allocate(f1(nxloc, nyloc, nzloc))
+    allocate(fprim(nxloc, nyloc, nzloc))
+    allocate(fpre(nxloc, nyloc, nzloc))
+    allocate(ferr(nxloc, nyloc, nzloc))
+
+    call get_keys_stamps(trim(path1), trim(rc), 3, trim(field), f_, sorted_keys, sorted_stamps, calc)
+    call deficit_field_to_time_field(trim(field), field_)
+    if(myrank == 0) call message('Verifying '// trim(field)//' vs difference in '//trim(field_))
+    call define_budget(trim(field),  budget,  term,  3, calc)
+    call define_budget(trim(field_), budget_, term_, 1, calc_)
+    sgn = reverse_base_budget_sign(trim(field_))
+    if(myrank == 0 .and. sgn == -1) call message('Reversed sign of base budget '//trim(field_))
+    
+    allocate(errors(size(sorted_keys)))
+    if(myrank == 0)call message(' ')
+
+    do k = 1, size(sorted_keys)
+      ! Deficit field
+      call eval_field(reader, 3, calc, trim(path1), trim(path2), trim(rc), trim(rcbase), &
+          trim(field), trim(f_), trim(sorted_keys(k)), trim(sorted_stamps(k)), f1)    
+
+      ! Primary field
+      call eval_field(reader, 1, calc_, trim(path2), trim(path2), trim(rc), trim(rc), &
+          trim(field_), trim(f_), trim(sorted_keys(k)), trim(sorted_stamps(k)), fprim)
+
+      ! Precursor field
+      call eval_field(reader, 1, calc_, trim(path2), trim(path2), trim(rcbase), trim(rcbase), &
+          trim(field_), trim(f_), trim(sorted_keys(k)), trim(sorted_stamps(k)), fpre)
+
+      ! Error
+      ferr = f1 - sgn*(fprim - fpre)
+      ferr = abs(ferr)
+      error = maxval(ferr)
+
+      ! Share with other ranks
+      call MPI_Allreduce(error, global_error, 1, MPI_DOUBLE_PRECISION, MPI_MAX, MPI_COMM_WORLD, ierr)
+      errors(k) = global_error
+      
+      if(myrank == 0) call message(' ')
+    end do
+
+    ! Export the max errors for each time step
+    if (myrank == 0)then
+      do k = 1, size(sorted_keys)
+        call message('Time stamp: '//trim(sorted_keys(k))//', max abs error: '//trim(to_string(errors(k))))
+      end do
+      call message(' ')
+    end if
+  end subroutine verify_budgets
+
+  function reverse_base_budget_sign(field) result(sgn)
+    implicit none
+    character(*), intent(in) :: field
+    integer :: sgn
+    select case(trim(field))
+    case('adv_x', 'adv_y', 'adv_z')
+      sgn = -1
+    case default
+      sgn=1
+    end select
+  end function reverse_base_budget_sign
+
+  subroutine deficit_field_to_time_field(field, field_)
+    character(*), intent(in) :: field
+    character(len=256), intent(out) :: field_
+
+    select case (trim(field))
+    case ('delta_u')
+      field_ = 'ubar'
+    case ('delta_v')
+      field_ = 'vbar'
+    case ('delta_w')
+      field_ = 'wbar'
+    case ('delta_T')
+      field_ = 'tbar'
+    case ('delta_p')
+      field_ = 'pbar'
+    case ('delta_tau11')
+      field_ = 'tau11'
+    case('delta_tau12')
+      field_ = 'tau12'
+    case('delta_tau13')
+      field_ = 'tau13'
+    case('delta_tau22')
+      field_ = 'tau22'
+    case('delta_tau23')
+      field_ = 'tau23'
+    case('delta_tau33')
+      field_ = 'tau33'
+    case('delta_ucor')
+      field_ = 'ucor'
+    case('delta_vcor')
+      field_ = 'vcor'
+    case('delta_bouyancy')
+      field_ = 'bouyancy'
+    case('delta_turbx')
+      field_ = 'turbx'
+    case('delta_turby')
+      field_ = 'turby'
+    case('delta_R11')
+      field_ = 'R11'
+    case('delta_R12')
+      field_ = 'R12'
+    case('delta_R13')
+      field_ = 'R13'
+    case('delta_R22')
+      field_ = 'R22'
+    case('delta_R23')
+      field_ = 'R23'
+    case('delta_R33')
+      field_ = 'R33'
+    case('delta_adv_x')
+      field_ = 'adv_x'
+    case('delta_adv_y')
+      field_ = 'adv_y'
+    case('delta_adv_z')
+      field_ = 'adv_z'
+    end select
+
+  end subroutine deficit_field_to_time_field
+
+  subroutine get_keys_stamps(path, rc, budget_source, field, f_, sorted_keys, sorted_stamps, calc)
+    implicit none
+    character(*), intent(in) :: path, rc
+    integer, intent(in) :: budget_source
+    character(*), intent(in) :: field
+    logical, intent(inout) :: calc
+    character(len=:), allocatable, intent(inout) :: sorted_keys(:), sorted_stamps(:)
+    character(len=256), intent(out):: f_
+    character(len=:), allocatable :: keys(:), stamps(:)
+    character(len=2048) :: pattern
+    character(len=1) :: budget
+    character(len=2) :: term    
+
+    if (budget_source == 0)then
+      f_ = field_to_name(trim(field))
+      call list_matching_keys(trim(path), 'Run'//trim(rc)//'_'//trim(f_)//'_t*.out', keys)
+      sorted_keys = sort_keys_numeric(keys)
+    else
+      f_ = trim(field)
+      pattern = 'Run'//trim(rc)
+      call define_budget(trim(field), budget, term, budget_source, calc) 
+      if(budget_source == 2)then        
+        pattern = trim(pattern)//'_deficit'
+      elseif(budget_source == 3) then       
+        pattern = trim(pattern)//'_mdeficit'
+      end if
+      pattern = trim(pattern)//'_budget'//budget//'_term'//term//'_t*_n~.s3D'
+      if (myrank == 0)then
+        call message('Pattern is '//trim(pattern))
+        if(calc) call message('The budget is evaluated using multiple files')
+      end if
+      call list_matching_keys_budget(trim(path), trim(pattern), keys, stamps)
+      call sort_keys_and_stamps_numeric(keys, stamps, sorted_keys, sorted_stamps)
+    end if
+    if (myrank == 0) call message(' ')
+  end subroutine
+
+  function get_deficit_field(fname, reader, path, rc, key, stamp, budgetsource) result(buffer)
+    implicit none
+    class(FieldReader2Decomp), intent(inout) :: reader
+    character(*), intent(in) :: fname, path, rc, key, stamp
+    integer, intent(in), optional :: budgetsource
+    character(len=1) :: budget
+    character(len=2) :: term
+    character(len=256) :: filename
+    logical :: calc=.false.
+    real(rk), allocatable :: buffer(:,:,:)
+    integer :: budgetsource_
+
+    if(present(budgetsource))then
+      budgetsource_ = budgetsource
+    else
+      budgetsource_ = 3
+    end if
+    
+    call define_budget(trim(fname), budget, term, budgetsource_, calc)
+    call create_file_name(budgetsource_, trim(rc), trim(fname), trim(budget), &
+          trim(term), trim(key), trim(stamp), filename)
+    buffer = reader%read_field(trim(path)//'/'//trim(filename))
+  end function
+
+  subroutine eval_field(reader, budget_source, calc, path, path2, rc, rcbase, field, f_, key, stamp, f1)
+    implicit none
+    logical, intent(inout) :: calc
+    class(FieldReader2Decomp), intent(inout) :: reader
+    character(*), intent(in) :: path, path2, rc, rcbase, field, f_, key, stamp
+    real(rk), intent(out) :: f1(:,:,:)
+    integer, intent(in) :: budget_source
+    character(len=256) :: filename
+    character(len=2) :: term
+    character(len=1) :: budget
+
+    if(calc)then
+        ! Compute budget from multiple files
+        call compute_budget_from_multiple_files(reader, trim(path), trim(path2), &
+          trim(rc), trim(rcbase), trim(field), trim(key), trim(stamp), f1)
+    else
+        call define_budget(trim(field), budget, term, budget_source, calc)
+        call create_file_name(budget_source, trim(rc), trim(f_), trim(budget), &
+                    trim(term), trim(key), trim(stamp), filename)
+        f1 = reader%read_field(trim(path)//'/'//trim(filename))
+    end if
+  end subroutine
 
   pure function real2string(z) result(tag)
     ! Convert slice coordinate to a compact string.
@@ -654,7 +853,7 @@ contains
   ! Utility function to get proper field name
   function field_to_name(field) result(name)
     character(len=1), intent(in) :: field
-    character(len=10)            :: name
+    character(len=256)            :: name
     select case (field)
     case ('u'); name = 'uVel'
     case ('v'); name = 'vVel'
@@ -666,90 +865,450 @@ contains
     end select
   end function field_to_name
 
-  function field_mode(field) result(mode)
-    character(len=*), intent(in) :: field
-    integer            :: mode
-    select case (trim(field))
-    case ('u', 'v', 'w', 'T', 'p'); mode = 0
-    case ('delta_u', 'delta_v', 'delta_w', &
-          'dup_dup','dvp_dvp','dwp_dwp',   &
-          'dup_bup','dvp_bvp','dwp_bwp', &
-          'delta_p', &
-          'adv_base_delta_u','adv_base_delta_v','adv_base_delta_w',&
-          'adv_delta_delta_u','adv_delta_delta_v','adv_delta_delta_w',&
-          'adv_delta_base_u','adv_delta_base_v','adv_delta_base_w'); mode = 2
-    case default; mode = 1
-    end select
-  end function field_mode
+  ! Utility function to form a file name
+  subroutine create_file_name(budget_source, rc, field, budget, term, key, stamp, fname)
+    implicit none
+    integer, intent(in) :: budget_source
+    character(len=*), intent(in) :: rc, field, budget, term, key, stamp
+    character(len=*), intent(out) :: fname
+
+    if (budget_source == 0) then
+        fname = 'Run'//trim(rc)//'_'//trim(field)//'_t'//trim(key)//'.out'
+    else
+        ! Budgets
+        fname = 'Run' // trim(rc)
+
+        select case (budget_source)
+        case (1)
+            fname = trim(fname) // '_budget'
+        case (2)
+            fname = trim(fname) // '_deficit_budget'
+        case (3)
+            fname = trim(fname) // '_mdeficit_budget'
+        end select
+    end if
+
+    fname = trim(fname)//trim(budget)//'_term'//trim(term)// &
+            '_t'//trim(key)//'_n'//trim(stamp)//'.s3D'
+
+  end subroutine create_file_name
+
+  ! Utility function to compute a field from multiple files
+  subroutine compute_budget_from_multiple_files(reader, path, path2, rc, rcbase, field, key, stamp, f1)
+  implicit none
+  class(FieldReader2Decomp), intent(inout) :: reader
+  character(*), intent(in) :: path, path2, rc, rcbase, field, key, stamp
+  real(rk), intent(out) :: f1(:,:,:)
+  real(rk), allocatable :: bf1(:,:,:), bf2(:,:,:), bf3(:,:,:)
+
+  allocate(bf1(size(f1,1), size(f1,2), size(f1,3)))
+  allocate(bf2(size(f1,1), size(f1,2), size(f1,3)))
+  allocate(bf3(size(f1,1), size(f1,2), size(f1,3)))
+
+  select case (trim(field))
+  case('delta_R11')
+    f1 = get_deficit_field('dup_dup', reader, trim(path), trim(rc), trim(key), trim(stamp)) + &
+     2.0*get_deficit_field('dup_bup', reader, trim(path), trim(rc), trim(key), trim(stamp))
+
+  case('delta_R12')
+    f1 = get_deficit_field('dup_dvp', reader, trim(path), trim(rc), trim(key), trim(stamp)) + &
+         get_deficit_field('dup_bvp', reader, trim(path), trim(rc), trim(key), trim(stamp)) + &
+         get_deficit_field('dvp_bup', reader, trim(path), trim(rc), trim(key), trim(stamp))
+
+  case('delta_R13')
+    f1 = get_deficit_field('dup_dwp', reader, trim(path), trim(rc), trim(key), trim(stamp)) + &
+         get_deficit_field('dup_bwp', reader, trim(path), trim(rc), trim(key), trim(stamp)) + &
+         get_deficit_field('dwp_bup', reader, trim(path), trim(rc), trim(key), trim(stamp))
+
+  case('delta_R22')
+    f1 = get_deficit_field('dvp_dvp', reader, trim(path), trim(rc), trim(key), trim(stamp)) + &
+     2.0*get_deficit_field('dvp_bvp', reader, trim(path), trim(rc), trim(key), trim(stamp))
+
+  case('delta_R23')
+    f1 = get_deficit_field('dvp_dwp', reader, trim(path), trim(rc), trim(key), trim(stamp)) + &
+         get_deficit_field('dvp_bwp', reader, trim(path), trim(rc), trim(key), trim(stamp)) + &
+         get_deficit_field('dwp_bvp', reader, trim(path), trim(rc), trim(key), trim(stamp))
+
+  case('delta_R33')
+    f1 = get_deficit_field('dwp_dwp', reader, trim(path), trim(rc), trim(key), trim(stamp)) + &
+     2.0*get_deficit_field('dwp_bwp', reader, trim(path), trim(rc), trim(key), trim(stamp))
+  
+  case('delta_adv_x')
+    bf1 = get_deficit_field('ddx_delta_u', reader, trim(path), trim(rc), trim(key), trim(stamp))
+    bf2 = get_deficit_field('ddy_delta_u', reader, trim(path), trim(rc), trim(key), trim(stamp))
+    bf3 = get_deficit_field('ddz_delta_u', reader, trim(path), trim(rc), trim(key), trim(stamp))
+
+    f1 = get_deficit_field('delta_u',    reader, trim(path), trim(rc), trim(key), trim(stamp)) *        &
+      (  get_deficit_field('ddx_base_u', reader, trim(path), trim(rc), trim(key), trim(stamp)) + bf1) + &
+         get_deficit_field('delta_v',    reader, trim(path), trim(rc), trim(key), trim(stamp)) *        &
+      (  get_deficit_field('ddy_base_u', reader, trim(path), trim(rc), trim(key), trim(stamp)) + bf2) + &
+         get_deficit_field('delta_w',    reader, trim(path), trim(rc), trim(key), trim(stamp)) *        &
+      (  get_deficit_field('ddz_base_u', reader, trim(path), trim(rc), trim(key), trim(stamp)) + bf3) + &
+      bf1*get_deficit_field('ubar', reader, trim(path2), '05', trim(key), trim(stamp), 1) + &
+      bf2*get_deficit_field('vbar', reader, trim(path2), '05', trim(key), trim(stamp), 1) + &
+      bf3*get_deficit_field('wbar', reader, trim(path2), '05', trim(key), trim(stamp), 1) 
+  
+  case('delta_adv_y')
+    bf1 = get_deficit_field('ddx_delta_v', reader, trim(path), trim(rc), trim(key), trim(stamp))
+    bf2 = get_deficit_field('ddy_delta_v', reader, trim(path), trim(rc), trim(key), trim(stamp))
+    bf3 = get_deficit_field('ddz_delta_v', reader, trim(path), trim(rc), trim(key), trim(stamp))
+
+    f1 = get_deficit_field('delta_u',    reader, trim(path), trim(rc), trim(key), trim(stamp)) *        &
+      (  get_deficit_field('ddx_base_v', reader, trim(path), trim(rc), trim(key), trim(stamp)) + bf1) + &
+         get_deficit_field('delta_v',    reader, trim(path), trim(rc), trim(key), trim(stamp)) *        &
+      (  get_deficit_field('ddy_base_v', reader, trim(path), trim(rc), trim(key), trim(stamp)) + bf2) + &
+         get_deficit_field('delta_w',    reader, trim(path), trim(rc), trim(key), trim(stamp)) *        &
+      (  get_deficit_field('ddz_base_v', reader, trim(path), trim(rc), trim(key), trim(stamp)) + bf3) + &
+      bf1*get_deficit_field('ubar', reader, trim(path2), '05', trim(key), trim(stamp), 1) + &
+      bf2*get_deficit_field('vbar', reader, trim(path2), '05', trim(key), trim(stamp), 1) + &
+      bf3*get_deficit_field('wbar', reader, trim(path2), '05', trim(key), trim(stamp), 1) 
+  
+  case('delta_adv_z')
+    bf1 = get_deficit_field('ddx_delta_w', reader, trim(path), trim(rc), trim(key), trim(stamp))
+    bf2 = get_deficit_field('ddy_delta_w', reader, trim(path), trim(rc), trim(key), trim(stamp))
+    bf3 = get_deficit_field('ddz_delta_w', reader, trim(path), trim(rc), trim(key), trim(stamp))
+
+    f1 = get_deficit_field('delta_u',    reader, trim(path), trim(rc), trim(key), trim(stamp)) *        &
+      (  get_deficit_field('ddx_base_w', reader, trim(path), trim(rc), trim(key), trim(stamp)) + bf1) + &
+         get_deficit_field('delta_v',    reader, trim(path), trim(rc), trim(key), trim(stamp)) *        &
+      (  get_deficit_field('ddy_base_w', reader, trim(path), trim(rc), trim(key), trim(stamp)) + bf2) + &
+         get_deficit_field('delta_w',    reader, trim(path), trim(rc), trim(key), trim(stamp)) *        &
+      (  get_deficit_field('ddz_base_w', reader, trim(path), trim(rc), trim(key), trim(stamp)) + bf3) + &
+      bf1*get_deficit_field('ubar', reader, trim(path2), '05', trim(key), trim(stamp), 1) + &
+      bf2*get_deficit_field('vbar', reader, trim(path2), '05', trim(key), trim(stamp), 1) + &
+      bf3*get_deficit_field('wbar', reader, trim(path2), '05', trim(key), trim(stamp), 1) 
+  
+  end select
+  end subroutine compute_budget_from_multiple_files
 
   ! Utility function to get proper budget name
-  subroutine define_budget(field, b, t)
+  subroutine define_budget(field, b, t, budget_source, calc)
     character(*), intent(in) :: field
+    integer, intent(in) :: budget_source
+    logical, intent(inout) :: calc
     character(1), intent(out) :: b
     character(2), intent(out) :: t
-    if(trim(field) == 'ubar')then
-      b = '0'; t = '01'
-    elseif(trim(field) == 'vbar')then
-      b = '0'; t = '02'
-    elseif(trim(field) == 'wbar')then
-      b = '0'; t = '03'
-    elseif(trim(field) == 'pbar')then
-      b = '0'; t = '10'
-    elseif(trim(field) == 'delta_u')then
-      b = '0'; t = '01'
-    elseif(trim(field) == 'delta_v')then
-      b = '0'; t = '02'
-    elseif(trim(field) == 'delta_w')then
-      b = '0'; t = '03'
-    elseif(trim(field) == 'dup_dup')then
-      b = '0'; t = '05'
-    elseif(trim(field) == 'dvp_dvp')then
-      b = '0'; t = '08'
-    elseif(trim(field) == 'dwp_dwp')then
-      b = '0'; t = '10'
-    elseif(trim(field) == 'dup_bup')then
-      b = '0'; t = '11'
-    elseif(trim(field) == 'dvp_bvp')then
-      b = '0'; t = '16'
-    elseif(trim(field) == 'dwp_bwp')then
-      b = '0'; t = '19'
-    elseif(trim(field) == 'R11')then
-      b = '0'; t = '04'
-    elseif(trim(field) == 'R22')then
-      b = '0'; t = '07'
-    elseif(trim(field) == 'R33')then
-      b = '0'; t = '09'
-    elseif(trim(field) == 'delta_p')then
-      b = '0'; t = '04'
-    elseif(trim(field) == 'adv_base_delta_u')then
-      b = '1'; t = '02'
-    elseif(trim(field) == 'adv_delta_delta_u')then
-      b = '1'; t = '03'
-    elseif(trim(field) == 'adv_delta_base_u')then
-      b = '1'; t = '04'
-    elseif(trim(field) == 'adv_base_delta_v')then
-      b = '1'; t = '12'
-    elseif(trim(field) == 'adv_delta_delta_v')then
-      b = '1'; t = '13'
-    elseif(trim(field) == 'adv_delta_base_v')then
-      b = '1'; t = '14'
-    elseif(trim(field) == 'adv_base_delta_w')then
-      b = '1'; t = '22'
-    elseif(trim(field) == 'adv_delta_delta_w')then
-      b = '1'; t = '23'
-    elseif(trim(field) == 'adv_delta_base_w')then
-      b = '1'; t = '24'
-    elseif(trim(field) == 'adv_u')then
-      b = '1'; t = '01'
+    if(budget_source == 1)then
+      ! Time averaged budgets
+      select case(trim(field))
+      case('ubar')
+        b = '0'; t = '01'
+      case('vbar')
+        b = '0'; t = '02'
+      case('wbar')
+        b = '0'; t = '03'      
+      case('R11')
+        b = '0'; t = '04'
+      case('R12')
+        b = '0'; t = '05'
+      case('R13')
+        b = '0'; t = '06'
+      case('R22')
+        b = '0'; t = '07'
+      case('R23')
+        b = '0'; t = '08'
+      case('R33')
+        b = '0'; t = '09'
+      case('pbar')
+        b = '0'; t = '10'
+      case('tau11')
+        b = '0'; t = '11'
+      case('tau12')
+        b = '0'; t = '12'
+      case('tau13')
+        b = '0'; t = '13'
+      case('tau22')
+        b = '0'; t = '14'
+      case('tau23')
+        b = '0'; t = '15'
+      case('tau33')
+        b = '0'; t = '16'
+      case('up_p')
+        b = '0'; t = '17'
+      case('vp_p')
+        b = '0'; t = '18'
+      case('wp_p')
+        b = '0'; t = '19'
+      case('tbar')
+        b = '0'; t = '26'
+      case('up_tp')
+        b = '0'; t = '27'
+      case('vp_tp')
+        b = '0'; t = '28'
+      case('wp_tp')
+        b = '0'; t = '29'
+      case('tp_tp')
+        b = '0'; t = '30'
+      case('adv_x')
+        b = '1'; t = '01'
+      case('turbx')
+        b = '1'; t = '04'
+      case('adv_y')
+        b = '1'; t = '05'
+      case('adv_z')
+        b = '1'; t = '08'
+      case('ucor')
+        b = '1'; t = '11'
+      case('vcor')
+        b = '1'; t = '13'
+      case('turby')
+        b = '1'; t = '15'
+      case('bouyancy')
+        b = '1'; t = '16'    
+      end select
+
+    elseif(budget_source == 2)then
+      ! Deficit budgets
+      select case(trim(field))
+      case('delta_u')
+        b = '0'; t = '01'
+      case('delta_v')
+        b = '0'; t = '02'
+      case('delta_w')
+        b = '0'; t = '03'
+      case('delta_p')
+        b = '0'; t = '04'
+      case('dup_dup')
+        b = '0'; t = '05'
+      case('dup_dvp')
+        b = '0'; t = '06'
+      case('dup_dwp')
+        b = '0'; t = '07' 
+      case('dvp_dvp')
+        b = '0'; t = '08'
+      case('dvp_dwp')
+        b = '0'; t = '09'
+      case('dwp_dwp')
+        b = '0'; t = '10'
+      case('dup_bup')
+        b = '0'; t = '11'
+      case('dup_bvp')
+        b = '0'; t = '12'
+      case('dvp_bup')
+        b = '0'; t = '13' 
+      case('dup_bwp')
+        b = '0'; t = '14'
+      case('dwp_bup')
+        b = '0'; t = '15'
+      case('dvp_bvp')
+        b = '0'; t = '16'
+      case('dvp_bwp')
+        b = '0'; t = '17'
+      case('dwp_bvp')
+        b = '0'; t = '18'
+      case('dwp_bwp')
+        b = '0'; t = '19'
+      case('delta_tau11')
+        b = '0'; t = '20'
+      case('delta_tau12')
+        b = '0'; t = '21'
+      case('delta_tau13')
+        b = '0'; t = '22'
+      case('delta_tau22')
+        b = '0'; t = '23'
+      case('delta_tau23')
+        b = '0'; t = '24'
+      case('delta_tau33')
+        b = '0'; t = '25'
+      case('delta_T')
+        b = '0'; t = '26'
+      case('dup_dTp')
+        b = '0'; t = '27'
+      case('dvp_dTp')
+        b = '0'; t = '28'
+      case('dwp_dTp')
+        b = '0'; t = '29'
+      end select
+
+    elseif(budget_source == 3)then
+      ! Mini deficit budgets
+      select case(trim(field))
+      case('delta_u')
+        b = '0'; t = '01'
+      case('delta_v')
+        b = '0'; t = '02'
+      case('delta_w')
+        b = '0'; t = '03'
+      case('delta_p')
+        b = '0'; t = '04'
+      case('delta_T')
+        b = '0'; t = '05'
+      case('delta_tau11')
+        b = '0'; t = '06'
+      case('delta_tau12')
+        b = '0'; t = '07'
+      case('delta_tau13')
+        b = '0'; t = '08'
+      case('delta_tau22')
+        b = '0'; t = '09'
+      case('delta_tau23')
+        b = '0'; t = '10'
+      case('delta_tau33')
+        b = '0'; t = '11'
+      case('delta_ucor')
+        b = '0'; t = '12'
+      case('delta_vcor')
+        b = '0'; t = '13'
+      case('delta_bouyancy')
+        b = '0'; t = '14'
+      case('delta_turbx')
+        b = '0'; t = '15'
+      case('delta_turby')
+        b = '0'; t = '16'
+      case('dup_dup')
+        b = '1'; t = '01'
+      case('dup_dvp')
+        b = '1'; t = '02'
+      case('dup_dwp')
+        b = '1'; t = '03' 
+      case('dvp_dvp')
+        b = '1'; t = '04'
+      case('dvp_dwp')
+        b = '1'; t = '05'
+      case('dwp_dwp')
+        b = '1'; t = '06'
+      case('dup_bup')
+        b = '1'; t = '07'
+      case('dup_bvp')
+        b = '1'; t = '08'
+      case('dvp_bup')
+        b = '1'; t = '09' 
+      case('dup_bwp')
+        b = '1'; t = '10'
+      case('dwp_bup')
+        b = '1'; t = '11'
+      case('dvp_bvp')
+        b = '1'; t = '12'
+      case('dvp_bwp')
+        b = '1'; t = '13'
+      case('dwp_bvp')
+        b = '1'; t = '14'
+      case('dwp_bwp')
+        b = '1'; t = '15'
+      case('ddx_delta_u')
+        b = '2'; t = '01'
+      case('ddy_delta_u')
+        b = '2'; t = '02' 
+      case('ddz_delta_u')
+        b = '2'; t = '03'
+      case('ddx_delta_v')
+        b = '2'; t = '04'
+      case('ddy_delta_v')
+        b = '2'; t = '05' 
+      case('ddz_delta_v')
+        b = '2'; t = '06' 
+      case('ddx_delta_w')
+        b = '2'; t = '07'
+      case('ddy_delta_w')
+        b = '2'; t = '08' 
+      case('ddz_delta_w')
+        b = '2'; t = '09'
+      case('ddx_base_u')
+        b = '2'; t = '10'
+      case('ddy_base_u')
+        b = '2'; t = '11' 
+      case('ddz_base_u')
+        b = '2'; t = '12'
+      case('ddx_base_v')
+        b = '2'; t = '13'
+      case('ddy_base_v')
+        b = '2'; t = '14' 
+      case('ddz_base_v')
+        b = '2'; t = '15' 
+      case('ddx_base_w')
+        b = '2'; t = '16'
+      case('ddy_base_w')
+        b = '2'; t = '17' 
+      case('ddz_base_w')
+        b = '2'; t = '18'
+      case('ddx_delta_p')
+        b = '3'; t = '01'
+      case('ddx_delta_tau11')
+        b = '3'; t = '02' 
+      case('ddy_delta_tau12')
+        b = '3'; t = '03'
+      case('ddz_delta_tau13')
+        b = '3'; t = '04'
+      case('ddx_dup_dup')
+        b = '3'; t = '05'
+      case('ddy_dup_dvp')
+        b = '3'; t = '06'
+      case('ddz_dup_dwp')
+        b = '3'; t = '07'      
+      case('ddx_dup_bup')
+        b = '3'; t = '08'
+      case('ddy_dup_bvp')
+        b = '3'; t = '09'
+      case('ddz_dup_bwp')
+        b = '3'; t = '10'
+      case('ddy_dvp_bup')
+        b = '3'; t = '11'
+      case('ddz_dwp_bup')
+        b = '3'; t = '12'  
+      case('pcov_dd')   
+        b = '4'; t = '01'
+      case('pcov_bd')    
+        b = '4'; t = '02'
+      case('pcov_db')    
+        b = '4'; t = '03'
+      case('sgsTr_bd')    
+        b = '4'; t = '04'
+      case('sgsTr_db')    
+        b = '4'; t = '05'
+      case('sgsTr_dd')    
+        b = '4'; t = '06'
+      case('sgsDis_db')    
+        b = '4'; t = '07'
+      case('sgsDis_bd')    
+        b = '4'; t = '08'
+      case('sgsDis_dd')    
+        b = '4'; t = '09'
+      case('tcov_dd')
+        b = '4'; t = '10'
+      case('tcov_db')
+        b = '4'; t = '11'
+      case('tcov_bd')
+        b = '4'; t = '12'
+      case('tkeTr_dbb')
+        b = '4'; t = '13'
+      case('tkeTr_bbd')
+        b = '4'; t = '14'
+      case('tkeTr_dbd')
+        b = '4'; t = '15'
+      case('tkeTr_bdd')
+        b = '4'; t = '16'
+      case('tkeTr_ddd')
+        b = '4'; t = '17'
+      case('tkeAdv_ddd')
+        b = '4'; t = '18'
+      case('tkeAdv_ddb')
+        b = '4'; t = '19'
+      case('tkeAdv_dbb')
+        b = '4'; t = '20'
+      case('tkeAdv_bdd')
+        b = '4'; t = '21'
+      case('tkeAdv_bdb')
+        b = '4'; t = '22'
+      case default
+        b = '0'; t = '01'; calc = .true.     
+      end select
     end if
   end subroutine define_budget
 
-  ! Utility function to convert integers or reals to strings
-  pure function to_string(i) result(str)
+  ! Utility function to convert integers to strings
+  pure function to_string_int(i) result(str)
     integer, intent(in) :: i
     character(len=32) :: str
     write(str, '(I0)') i
-  end function to_string
+  end function to_string_int
+
+  pure function to_string_real(x) result(str)
+    real(rk), intent(in) :: x
+    character(len=32) :: str
+    ! ES format avoids overflow and is portable
+    write(str, '(ES16.8)') x
+    str = adjustl(str)
+  end function to_string_real
 
   ! Utility subroutine to print messages
   subroutine message(msg)
@@ -1472,8 +2031,9 @@ program MPIR3D_
   character(len=1) :: slice_axis = 'z'
   real(rk) :: slice_coord(1000)
   real(rk), allocatable :: slice_coord_(:)
+  integer :: budget_source
   namelist /SETUP/ nx, ny, nz, Lx, Ly, Lz, path, outdir, runid, taskid, field, &
-                   slice_axis, num_slice, slice_coord
+                   slice_axis, num_slice, slice_coord, budget_source
       
   ! Initiate MPI
   ! -------------------------------------------------------------------------!
@@ -1508,11 +2068,14 @@ program MPIR3D_
 
   if (taskid == 0)then
     ! Horizontal average
-    call ha_driver(reader, Lz, runid, trim(path), trim(outdir), trim(field))
+    call ha_driver(reader, Lz, runid, trim(path), trim(outdir), trim(field), budget_source)
   else if (taskid == 1) then
     ! Slice
     call slice_driver(reader, Lx, Ly, Lz, runid, trim(path), trim(outdir), trim(field), &
-      slice_axis, num_slice, slice_coord_)
+      slice_axis, num_slice, slice_coord_, budget_source)
+  else if (taskid == -1) then
+    ! Miscellaneous tasks
+    call miscellaneous_driver(reader, runid, trim(field))
   end if
   
   if(myrank == 0) call message('Wrapping up ...')
