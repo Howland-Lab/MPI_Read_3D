@@ -14,6 +14,11 @@ module MPIR3D
   integer, parameter :: rk = mytype
   integer :: myrank = -1
   integer :: nprocs = -1
+  integer :: instfieldsrc = 0
+  integer :: timeavgsrc = 1
+  integer :: mdgtsrc = 2
+  integer :: mbdgtsrc = 3
+  integer :: nxloc_,nyloc_,nzloc_
 
   interface to_string
     module procedure to_string_int
@@ -270,7 +275,6 @@ contains
     character(len=2) :: rc
     character(len=256):: f_
     integer :: k, nx, ny, nz, xs, xe, ys, ye, zs, ze, nxloc, nyloc, nzloc
-    logical :: calc=.false.
 
     ! Fetch local and global sizes & start indices
     call reader%local_shape(nxloc, nyloc, nzloc)
@@ -287,12 +291,11 @@ contains
     z = linspace(0.0_rk, Lz, nz)  
 
     ! Get file list and sort by time
-    call get_keys_stamps(trim(path), trim(rc), budget_source, trim(field), f_, sorted_keys, sorted_stamps, calc)
+    call get_keys_stamps(trim(path), trim(rc), budget_source, trim(field), f_, sorted_keys, sorted_stamps)
     
     do k = 1, size(sorted_keys)
 
-      call eval_field(reader, budget_source, calc, trim(path), trim(path), trim(rc), trim(rc), &
-          trim(field), trim(f_), trim(sorted_keys(k)), trim(sorted_stamps(k)), f1)
+      f1 = eval_field(trim(field), reader, budget_source, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
 
       if (field == 'S') then
         block
@@ -352,7 +355,6 @@ contains
     integer :: i, j, isl, ierr, nx1, nx2, nax
     integer :: x1s, x1e, x2s, x2e, axs, axe
     real(rk) :: L1, L2, Lax, slice_
-    logical :: calc=.false.
 
     ! Handling reference to wind speed and wind direction
     if(trim(field) == 'S')then
@@ -373,7 +375,7 @@ contains
     allocate(f1(nxloc, nyloc, nzloc))
 
     ! Get file list and sort by time
-    call get_keys_stamps(trim(path), trim(rc), budget_source, trim(field), f_, sorted_keys, sorted_stamps, calc)
+    call get_keys_stamps(trim(path), trim(rc), budget_source, trim(field), f_, sorted_keys, sorted_stamps)
     
     ! Figure which coordinate names to use
     select case (ax)
@@ -427,8 +429,7 @@ contains
       ! Loop over time snapshots
       do k = 1, size(sorted_keys)
 
-        call eval_field(reader, budget_source, calc, trim(path), trim(path), trim(rc), trim(rc), &
-          trim(field), trim(f_), trim(sorted_keys(k)), trim(sorted_stamps(k)), f1)
+        f1 = eval_field(trim(field), reader, budget_source, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
 
         ! 2) Build local contributions to the two bracketing planes
         local_slice0 = 0.0_rk
@@ -522,9 +523,8 @@ contains
     integer, intent(in) :: runid
     character(*), intent(in) :: field
     character(len=256) :: path1, path2, field_, f_
-    character(len=2) :: rc, term, term_, rcbase
-    character(len=1) :: budget, budget_
-    integer :: k, ierr, sgn=1
+    character(len=2) :: rc, rcbase
+    integer :: k, ierr
     real(rk) :: error, global_error
     real(rk), allocatable :: errors(:)
 
@@ -532,7 +532,6 @@ contains
     integer :: nx, ny, nz
     integer :: nxloc, nyloc, nzloc
     integer :: xs, xe, ys, ye, zs, ze
-    logical :: calc=.false., calc_= .false.
 
     ! Time keys
     character(len=:), allocatable :: sorted_keys(:), sorted_stamps(:)
@@ -558,32 +557,25 @@ contains
     allocate(fpre(nxloc, nyloc, nzloc))
     allocate(ferr(nxloc, nyloc, nzloc))
 
-    call get_keys_stamps(trim(path1), trim(rc), 3, trim(field), f_, sorted_keys, sorted_stamps, calc)
+    call get_keys_stamps(trim(path1), trim(rc), 3, trim(field), f_, sorted_keys, sorted_stamps)
     call deficit_field_to_time_field(trim(field), field_)
     if(myrank == 0) call message('Verifying '// trim(field)//' vs difference in '//trim(field_))
-    call define_budget(trim(field),  budget,  term,  3, calc)
-    call define_budget(trim(field_), budget_, term_, 1, calc_)
-    sgn = reverse_base_budget_sign(trim(field_))
-    if(myrank == 0 .and. sgn == -1) call message('Reversed sign of base budget '//trim(field_))
     
     allocate(errors(size(sorted_keys)))
     if(myrank == 0)call message(' ')
 
     do k = 1, size(sorted_keys)
       ! Deficit field
-      call eval_field(reader, 3, calc, trim(path1), trim(path2), trim(rc), trim(rcbase), &
-          trim(field), trim(f_), trim(sorted_keys(k)), trim(sorted_stamps(k)), f1)    
+      f1 = eval_field(trim(field), reader, mbdgtsrc, trim(path1), trim(rc), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
 
       ! Primary field
-      call eval_field(reader, 1, calc_, trim(path2), trim(path2), trim(rc), trim(rc), &
-          trim(field_), trim(f_), trim(sorted_keys(k)), trim(sorted_stamps(k)), fprim)
+      fprim = eval_field(trim(field_), reader, timeavgsrc, trim(path2), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
 
       ! Precursor field
-      call eval_field(reader, 1, calc_, trim(path2), trim(path2), trim(rcbase), trim(rcbase), &
-          trim(field_), trim(f_), trim(sorted_keys(k)), trim(sorted_stamps(k)), fpre)
+      fpre = eval_field(trim(field_), reader, timeavgsrc, trim(path1), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
 
       ! Error
-      ferr = f1 - sgn*(fprim - fpre)
+      ferr = f1 - (fprim - fpre)
       ferr = abs(ferr)
       error = maxval(ferr)
 
@@ -608,7 +600,8 @@ contains
     character(*), intent(in) :: field
     integer :: sgn
     select case(trim(field))
-    case('adv_x', 'adv_y', 'adv_z')
+    case('adv_x', 'adv_y', 'adv_z','ddx_p','ddy_p','ddz_p', &
+         'usgs','vsgs','wsgs','pcov','sgsTr','bouyancy')
       sgn = -1
     case default
       sgn=1
@@ -670,24 +663,40 @@ contains
       field_ = 'adv_y'
     case('delta_adv_z')
       field_ = 'adv_z'
+    case('ddx_delta_p')
+      field_ = 'ddx_p'
+    case('ddj_delta_tau1j')
+      field_ = 'usgs'
+    case('ddj_delta_tau2j')
+      field_ = 'vsgs'
+    case('ddj_delta_tau3j')
+      field_ = 'wsgs'
+    case('delta_pcov')
+      field_ = 'pcov'
+    case('delta_sgsTr')
+      field_ = 'sgsTr'
+    case('delta_sgsDiss')
+      field_ = 'sgsDiss'
+    case('delta_tcov')
+      field_ = 'tcov'
     end select
 
   end subroutine deficit_field_to_time_field
 
-  subroutine get_keys_stamps(path, rc, budget_source, field, f_, sorted_keys, sorted_stamps, calc)
+  subroutine get_keys_stamps(path, rc, budget_source, field, f_, sorted_keys, sorted_stamps)
     implicit none
     character(*), intent(in) :: path, rc
     integer, intent(in) :: budget_source
     character(*), intent(in) :: field
-    logical, intent(inout) :: calc
     character(len=:), allocatable, intent(inout) :: sorted_keys(:), sorted_stamps(:)
     character(len=256), intent(out):: f_
     character(len=:), allocatable :: keys(:), stamps(:)
     character(len=2048) :: pattern
     character(len=1) :: budget
     character(len=2) :: term    
+    logical :: calc=.false.
 
-    if (budget_source == 0)then
+    if (budget_source == instfieldsrc)then
       f_ = field_to_name(trim(field))
       call list_matching_keys(trim(path), 'Run'//trim(rc)//'_'//trim(f_)//'_t*.out', keys)
       sorted_keys = sort_keys_numeric(keys)
@@ -711,52 +720,35 @@ contains
     if (myrank == 0) call message(' ')
   end subroutine
 
-  function get_deficit_field(fname, reader, path, rc, key, stamp, budgetsource) result(buffer)
+  function eval_field(field, reader, budget_source, path, rc, rcbase, key, stamp) result(f1)
     implicit none
+    real(rk) :: f1(nxloc_,nyloc_,nzloc_)
     class(FieldReader2Decomp), intent(inout) :: reader
-    character(*), intent(in) :: fname, path, rc, key, stamp
-    integer, intent(in), optional :: budgetsource
-    character(len=1) :: budget
-    character(len=2) :: term
-    character(len=256) :: filename
-    logical :: calc=.false.
-    real(rk), allocatable :: buffer(:,:,:)
-    integer :: budgetsource_
-
-    if(present(budgetsource))then
-      budgetsource_ = budgetsource
-    else
-      budgetsource_ = 3
-    end if
-    
-    call define_budget(trim(fname), budget, term, budgetsource_, calc)
-    call create_file_name(budgetsource_, trim(rc), trim(fname), trim(budget), &
-          trim(term), trim(key), trim(stamp), filename)
-    buffer = reader%read_field(trim(path)//'/'//trim(filename))
-  end function
-
-  subroutine eval_field(reader, budget_source, calc, path, path2, rc, rcbase, field, f_, key, stamp, f1)
-    implicit none
-    logical, intent(inout) :: calc
-    class(FieldReader2Decomp), intent(inout) :: reader
-    character(*), intent(in) :: path, path2, rc, rcbase, field, f_, key, stamp
-    real(rk), intent(out) :: f1(:,:,:)
+    character(*), intent(in) :: path, rc, rcbase, field, key, stamp
     integer, intent(in) :: budget_source
-    character(len=256) :: filename
+    character(len=256) :: filename, f_
     character(len=2) :: term
     character(len=1) :: budget
+    logical :: calc=.false.
+    integer :: sgn=1
+
+    call define_budget(trim(field), budget, term, budget_source, calc)
+    f_ = field_to_name(trim(field))
 
     if(calc)then
         ! Compute budget from multiple files
-        call compute_budget_from_multiple_files(reader, trim(path), trim(path2), &
+        call compute_budget_from_multiple_files(reader, trim(path), &
           trim(rc), trim(rcbase), trim(field), trim(key), trim(stamp), f1)
     else
-        call define_budget(trim(field), budget, term, budget_source, calc)
+        sgn = reverse_base_budget_sign(trim(field))
+        if(myrank == 0 .and. sgn == -1) call message('Reversed sign of time-averaged budget '//trim(field))
+    
         call create_file_name(budget_source, trim(rc), trim(f_), trim(budget), &
                     trim(term), trim(key), trim(stamp), filename)
         f1 = reader%read_field(trim(path)//'/'//trim(filename))
+        f1 = f1 * sgn
     end if
-  end subroutine
+  end function
 
   pure function real2string(z) result(tag)
     ! Convert slice coordinate to a compact string.
@@ -852,16 +844,16 @@ contains
 
   ! Utility function to get proper field name
   function field_to_name(field) result(name)
-    character(len=1), intent(in) :: field
+    character(*), intent(in) :: field
     character(len=256)            :: name
-    select case (field)
+    select case (trim(field))
     case ('u'); name = 'uVel'
     case ('v'); name = 'vVel'
     case ('w'); name = 'wVel'
     case ('T'); name = 'potT'
     case ('p'); name = 'prss'
     case ('S'); name = 'uVel'
-    case default; name = 'uVel'
+    case default; name = trim(field)
     end select
   end function field_to_name
 
@@ -894,90 +886,143 @@ contains
   end subroutine create_file_name
 
   ! Utility function to compute a field from multiple files
-  subroutine compute_budget_from_multiple_files(reader, path, path2, rc, rcbase, field, key, stamp, f1)
+  subroutine compute_budget_from_multiple_files(reader, path, rc, rcbase, field, key, stamp, f1)
   implicit none
   class(FieldReader2Decomp), intent(inout) :: reader
-  character(*), intent(in) :: path, path2, rc, rcbase, field, key, stamp
+  character(*), intent(in) :: path, rc, rcbase, field, key, stamp
   real(rk), intent(out) :: f1(:,:,:)
-  real(rk), allocatable :: bf1(:,:,:), bf2(:,:,:), bf3(:,:,:)
-
-  allocate(bf1(size(f1,1), size(f1,2), size(f1,3)))
-  allocate(bf2(size(f1,1), size(f1,2), size(f1,3)))
-  allocate(bf3(size(f1,1), size(f1,2), size(f1,3)))
-
+  
   select case (trim(field))
   case('delta_R11')
-    f1 = get_deficit_field('dup_dup', reader, trim(path), trim(rc), trim(key), trim(stamp)) + &
-     2.0*get_deficit_field('dup_bup', reader, trim(path), trim(rc), trim(key), trim(stamp))
-
+    f1 = eval_field('dup_dup', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+     2.0*eval_field('dup_bup', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
+    
   case('delta_R12')
-    f1 = get_deficit_field('dup_dvp', reader, trim(path), trim(rc), trim(key), trim(stamp)) + &
-         get_deficit_field('dup_bvp', reader, trim(path), trim(rc), trim(key), trim(stamp)) + &
-         get_deficit_field('dvp_bup', reader, trim(path), trim(rc), trim(key), trim(stamp))
+    f1 = eval_field('dup_dvp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('dup_bvp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('dvp_bup', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
 
   case('delta_R13')
-    f1 = get_deficit_field('dup_dwp', reader, trim(path), trim(rc), trim(key), trim(stamp)) + &
-         get_deficit_field('dup_bwp', reader, trim(path), trim(rc), trim(key), trim(stamp)) + &
-         get_deficit_field('dwp_bup', reader, trim(path), trim(rc), trim(key), trim(stamp))
+    f1 = eval_field('dup_dwp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('dup_bwp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('dvp_bwp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
 
   case('delta_R22')
-    f1 = get_deficit_field('dvp_dvp', reader, trim(path), trim(rc), trim(key), trim(stamp)) + &
-     2.0*get_deficit_field('dvp_bvp', reader, trim(path), trim(rc), trim(key), trim(stamp))
+    f1 = eval_field('dvp_dvp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+     2.0*eval_field('dvp_bvp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
 
   case('delta_R23')
-    f1 = get_deficit_field('dvp_dwp', reader, trim(path), trim(rc), trim(key), trim(stamp)) + &
-         get_deficit_field('dvp_bwp', reader, trim(path), trim(rc), trim(key), trim(stamp)) + &
-         get_deficit_field('dwp_bvp', reader, trim(path), trim(rc), trim(key), trim(stamp))
+    f1 = eval_field('dvp_dwp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('dvp_bwp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('dwp_bvp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
 
   case('delta_R33')
-    f1 = get_deficit_field('dwp_dwp', reader, trim(path), trim(rc), trim(key), trim(stamp)) + &
-     2.0*get_deficit_field('dwp_bwp', reader, trim(path), trim(rc), trim(key), trim(stamp))
+    f1 = eval_field('dwp_dwp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+     2.0*eval_field('dwp_bwp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
   
   case('delta_adv_x')
-    bf1 = get_deficit_field('ddx_delta_u', reader, trim(path), trim(rc), trim(key), trim(stamp))
-    bf2 = get_deficit_field('ddy_delta_u', reader, trim(path), trim(rc), trim(key), trim(stamp))
-    bf3 = get_deficit_field('ddz_delta_u', reader, trim(path), trim(rc), trim(key), trim(stamp))
+    block 
+      real(rk), allocatable :: bf1(:,:,:), bf2(:,:,:), bf3(:,:,:)
+      allocate(bf1(size(f1,1), size(f1,2), size(f1,3)))
+      allocate(bf2(size(f1,1), size(f1,2), size(f1,3)))
+      allocate(bf3(size(f1,1), size(f1,2), size(f1,3)))
+            
+      bf1 = eval_field('ddx_delta_u', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
+      bf2 = eval_field('ddy_delta_u', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
+      bf3 = eval_field('ddz_delta_u', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
 
-    f1 = get_deficit_field('delta_u',    reader, trim(path), trim(rc), trim(key), trim(stamp)) *        &
-      (  get_deficit_field('ddx_base_u', reader, trim(path), trim(rc), trim(key), trim(stamp)) + bf1) + &
-         get_deficit_field('delta_v',    reader, trim(path), trim(rc), trim(key), trim(stamp)) *        &
-      (  get_deficit_field('ddy_base_u', reader, trim(path), trim(rc), trim(key), trim(stamp)) + bf2) + &
-         get_deficit_field('delta_w',    reader, trim(path), trim(rc), trim(key), trim(stamp)) *        &
-      (  get_deficit_field('ddz_base_u', reader, trim(path), trim(rc), trim(key), trim(stamp)) + bf3) + &
-      bf1*get_deficit_field('ubar', reader, trim(path2), '05', trim(key), trim(stamp), 1) + &
-      bf2*get_deficit_field('vbar', reader, trim(path2), '05', trim(key), trim(stamp), 1) + &
-      bf3*get_deficit_field('wbar', reader, trim(path2), '05', trim(key), trim(stamp), 1) 
-  
+      f1 = eval_field('delta_u',    reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))   * &
+      (bf1+eval_field('ddx_base_u', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)))  + &
+           eval_field('delta_v',    reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))   * &
+      (bf2+eval_field('ddy_base_u', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)))  + &
+           eval_field('delta_w',    reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))   * &
+      (bf3+eval_field('ddz_base_u', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)))  + &
+        bf1*eval_field('ubar', reader, timeavgsrc, trim(path), trim(rcbase), trim(rcbase), trim(key), trim(stamp))  + &
+        bf2*eval_field('vbar', reader, timeavgsrc, trim(path), trim(rcbase), trim(rcbase), trim(key), trim(stamp))  + &
+        bf3*eval_field('wbar', reader, timeavgsrc, trim(path), trim(rcbase), trim(rcbase), trim(key), trim(stamp)) 
+      deallocate(bf1, bf2, bf3)
+  end block
   case('delta_adv_y')
-    bf1 = get_deficit_field('ddx_delta_v', reader, trim(path), trim(rc), trim(key), trim(stamp))
-    bf2 = get_deficit_field('ddy_delta_v', reader, trim(path), trim(rc), trim(key), trim(stamp))
-    bf3 = get_deficit_field('ddz_delta_v', reader, trim(path), trim(rc), trim(key), trim(stamp))
+    block 
+      real(rk), allocatable :: bf1(:,:,:), bf2(:,:,:), bf3(:,:,:)
+      allocate(bf1(size(f1,1), size(f1,2), size(f1,3)))
+      allocate(bf2(size(f1,1), size(f1,2), size(f1,3)))
+      allocate(bf3(size(f1,1), size(f1,2), size(f1,3)))
+            
+      bf1 = eval_field('ddx_delta_v', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
+      bf2 = eval_field('ddy_delta_v', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
+      bf3 = eval_field('ddz_delta_v', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
 
-    f1 = get_deficit_field('delta_u',    reader, trim(path), trim(rc), trim(key), trim(stamp)) *        &
-      (  get_deficit_field('ddx_base_v', reader, trim(path), trim(rc), trim(key), trim(stamp)) + bf1) + &
-         get_deficit_field('delta_v',    reader, trim(path), trim(rc), trim(key), trim(stamp)) *        &
-      (  get_deficit_field('ddy_base_v', reader, trim(path), trim(rc), trim(key), trim(stamp)) + bf2) + &
-         get_deficit_field('delta_w',    reader, trim(path), trim(rc), trim(key), trim(stamp)) *        &
-      (  get_deficit_field('ddz_base_v', reader, trim(path), trim(rc), trim(key), trim(stamp)) + bf3) + &
-      bf1*get_deficit_field('ubar', reader, trim(path2), '05', trim(key), trim(stamp), 1) + &
-      bf2*get_deficit_field('vbar', reader, trim(path2), '05', trim(key), trim(stamp), 1) + &
-      bf3*get_deficit_field('wbar', reader, trim(path2), '05', trim(key), trim(stamp), 1) 
+      f1 = eval_field('delta_u',    reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))   * &
+      (bf1+eval_field('ddx_base_v', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)))  + &
+           eval_field('delta_v',    reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))   * &
+      (bf2+eval_field('ddy_base_v', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)))  + &
+           eval_field('delta_w',    reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))   * &
+      (bf3+eval_field('ddz_base_v', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)))  + &
+        bf1*eval_field('ubar', reader, timeavgsrc, trim(path), trim(rcbase), trim(rcbase), trim(key), trim(stamp))  + &
+        bf2*eval_field('vbar', reader, timeavgsrc, trim(path), trim(rcbase), trim(rcbase), trim(key), trim(stamp))  + &
+        bf3*eval_field('wbar', reader, timeavgsrc, trim(path), trim(rcbase), trim(rcbase), trim(key), trim(stamp)) 
+    deallocate(bf1, bf2, bf3)
+  end block
   
   case('delta_adv_z')
-    bf1 = get_deficit_field('ddx_delta_w', reader, trim(path), trim(rc), trim(key), trim(stamp))
-    bf2 = get_deficit_field('ddy_delta_w', reader, trim(path), trim(rc), trim(key), trim(stamp))
-    bf3 = get_deficit_field('ddz_delta_w', reader, trim(path), trim(rc), trim(key), trim(stamp))
+    block 
+      real(rk), allocatable :: bf1(:,:,:), bf2(:,:,:), bf3(:,:,:)
+      allocate(bf1(size(f1,1), size(f1,2), size(f1,3)))
+      allocate(bf2(size(f1,1), size(f1,2), size(f1,3)))
+      allocate(bf3(size(f1,1), size(f1,2), size(f1,3)))
+            
+      bf1 = eval_field('ddx_delta_w', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
+      bf2 = eval_field('ddy_delta_w', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
+      bf3 = eval_field('ddz_delta_w', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
 
-    f1 = get_deficit_field('delta_u',    reader, trim(path), trim(rc), trim(key), trim(stamp)) *        &
-      (  get_deficit_field('ddx_base_w', reader, trim(path), trim(rc), trim(key), trim(stamp)) + bf1) + &
-         get_deficit_field('delta_v',    reader, trim(path), trim(rc), trim(key), trim(stamp)) *        &
-      (  get_deficit_field('ddy_base_w', reader, trim(path), trim(rc), trim(key), trim(stamp)) + bf2) + &
-         get_deficit_field('delta_w',    reader, trim(path), trim(rc), trim(key), trim(stamp)) *        &
-      (  get_deficit_field('ddz_base_w', reader, trim(path), trim(rc), trim(key), trim(stamp)) + bf3) + &
-      bf1*get_deficit_field('ubar', reader, trim(path2), '05', trim(key), trim(stamp), 1) + &
-      bf2*get_deficit_field('vbar', reader, trim(path2), '05', trim(key), trim(stamp), 1) + &
-      bf3*get_deficit_field('wbar', reader, trim(path2), '05', trim(key), trim(stamp), 1) 
+      f1 = eval_field('delta_u',    reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))   * &
+      (bf1+eval_field('ddx_base_w', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)))  + &
+           eval_field('delta_v',    reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))   * &
+      (bf2+eval_field('ddy_base_w', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)))  + &
+           eval_field('delta_w',    reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))   * &
+      (bf3+eval_field('ddz_base_w', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)))  + &
+        bf1*eval_field('ubar', reader, timeavgsrc, trim(path), trim(rcbase), trim(rcbase), trim(key), trim(stamp))  + &
+        bf2*eval_field('vbar', reader, timeavgsrc, trim(path), trim(rcbase), trim(rcbase), trim(key), trim(stamp))  + &
+        bf3*eval_field('wbar', reader, timeavgsrc, trim(path), trim(rcbase), trim(rcbase), trim(key), trim(stamp)) 
+    deallocate(bf1, bf2, bf3)
+  end block
+
+  case('delta_div')
+    f1 = eval_field('ddx_delta_u', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('ddy_delta_v', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('ddz_delta_w', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
+
+  case('base_div')  
+    f1 = eval_field('ddx_base_u', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('ddy_base_v', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('ddz_base_w', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
   
+  case('ddj_delta_tau1j')
+    f1 = eval_field('ddx_delta_tau11', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('ddy_delta_tau12', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('ddz_delta_tau13', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
+
+  case('delta_pcov')
+    f1 = eval_field('pcov_dd', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('pcov_bd', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('pcov_db', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
+  
+  case('delta_sgsTr')
+    f1 = eval_field('sgsTr_bd', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('sgsTr_db', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('sgsTr_dd', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
+
+  case('delta_sgsDiss')
+    f1 = eval_field('sgsDiss_db', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('sgsDiss_bd', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('sgsDiss_dd', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
+
+  case('delta_tcov')
+    f1 = eval_field('tcov_dd', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('tcov_db', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('tcov_bd', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
+
   end select
   end subroutine compute_budget_from_multiple_files
 
@@ -988,6 +1033,8 @@ contains
     logical, intent(inout) :: calc
     character(1), intent(out) :: b
     character(2), intent(out) :: t
+
+    calc=.false.
     if(budget_source == 1)then
       ! Time averaged budgets
       select case(trim(field))
@@ -1041,12 +1088,20 @@ contains
         b = '0'; t = '30'
       case('adv_x')
         b = '1'; t = '01'
+      case('ddx_p')
+        b = '1'; t = '02'
+      case('usgs')
+        b = '1'; t = '03'
       case('turbx')
         b = '1'; t = '04'
       case('adv_y')
         b = '1'; t = '05'
+      case('vsgs')
+        b = '1'; t = '07'
       case('adv_z')
         b = '1'; t = '08'
+      case('wsgs')
+        b = '1'; t = '10'
       case('ucor')
         b = '1'; t = '11'
       case('vcor')
@@ -1054,7 +1109,15 @@ contains
       case('turby')
         b = '1'; t = '15'
       case('bouyancy')
-        b = '1'; t = '16'    
+        b = '1'; t = '16'  
+      case('pcov')  
+        b = '3'; t = '04'
+      case('sgsTr')
+        b = '3'; t = '05'
+      case('sgsDiss')
+        b = '3'; t = '06'
+      case('tcov')  
+        b = '3'; t = '08'
       end select
 
     elseif(budget_source == 2)then
@@ -1257,11 +1320,11 @@ contains
         b = '4'; t = '05'
       case('sgsTr_dd')    
         b = '4'; t = '06'
-      case('sgsDis_db')    
+      case('sgsDiss_db')    
         b = '4'; t = '07'
-      case('sgsDis_bd')    
+      case('sgsDiss_bd')    
         b = '4'; t = '08'
-      case('sgsDis_dd')    
+      case('sgsDiss_dd')    
         b = '4'; t = '09'
       case('tcov_dd')
         b = '4'; t = '10'
@@ -2031,7 +2094,7 @@ program MPIR3D_
   character(len=1) :: slice_axis = 'z'
   real(rk) :: slice_coord(1000)
   real(rk), allocatable :: slice_coord_(:)
-  integer :: budget_source
+  integer :: budget_source, nxloc, nyloc, nzloc
   namelist /SETUP/ nx, ny, nz, Lx, Ly, Lz, path, outdir, runid, taskid, field, &
                    slice_axis, num_slice, slice_coord, budget_source
       
@@ -2065,6 +2128,10 @@ program MPIR3D_
 
   ! Initiate reader
   call reader%init(nx, ny, nz)
+  call reader%local_shape(nxloc, nyloc, nzloc)
+  nxloc_=nxloc
+  nyloc_=nyloc
+  nzloc_=nzloc
 
   if (taskid == 0)then
     ! Horizontal average
