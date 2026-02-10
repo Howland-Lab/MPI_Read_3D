@@ -507,22 +507,22 @@ contains
     if (allocated(slice_interp))  deallocate(slice_interp)
   end subroutine slice_driver
 
-  subroutine miscellaneous_driver(reader, runid, field)
+  subroutine miscellaneous_driver(reader, runid, field, path)
     implicit none
     class(FieldReader2Decomp), intent(inout) :: reader
     integer, intent(in) :: runid
-    character(*), intent(in) :: field
+    character(*), intent(in) :: field, path
 
-    call verify_budgets(reader, runid, field)
+    call verify_budgets(reader, runid, trim(field), trim(path))
 
   end subroutine miscellaneous_driver
 
-  subroutine verify_budgets(reader, runid, field)
+  subroutine verify_budgets(reader, runid, field, path)
     implicit none
     class(FieldReader2Decomp), intent(inout) :: reader
     integer, intent(in) :: runid
-    character(*), intent(in) :: field
-    character(len=256) :: path1, path2, field_, f_
+    character(*), intent(in) :: field, path
+    character(len=256) :: field_, f_
     character(len=2) :: rc, rcbase
     integer :: k, ierr
     real(rk) :: error, global_error
@@ -539,9 +539,6 @@ contains
     ! Local 3D field
     real(rk), allocatable, target :: f1(:,:,:), fprim(:,:,:), fpre(:,:,:), ferr(:,:,:)
 
-    path1 = '/anvil/scratch/x-kali/PadeOpsSims/NREL5MW-8x5-56x20x8/LR10/test_mini_budgets'
-    path2 = '/anvil/scratch/x-kali/PadeOpsSims/NREL5MW-8x5-56x20x8/LR10/test_mini_budgets/run_orig_deficit_budget'
-
     ! Convert runid to character
     write(rc, '(I2.2)') runid
     write(rcbase, '(I2.2)') (runid-1)
@@ -557,7 +554,7 @@ contains
     allocate(fpre(nxloc, nyloc, nzloc))
     allocate(ferr(nxloc, nyloc, nzloc))
 
-    call get_keys_stamps(trim(path1), trim(rc), 3, trim(field), f_, sorted_keys, sorted_stamps)
+    call get_keys_stamps(trim(path), trim(rc), 3, trim(field), f_, sorted_keys, sorted_stamps)
     call deficit_field_to_time_field(trim(field), field_)
     if(myrank == 0) call message('Verifying '// trim(field)//' vs difference in '//trim(field_))
     
@@ -566,18 +563,19 @@ contains
 
     do k = 1, size(sorted_keys)
       ! Deficit field
-      f1 = eval_field(trim(field), reader, mbdgtsrc, trim(path1), trim(rc), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+      f1 = eval_field(trim(field), reader, mbdgtsrc, trim(path), trim(rc), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
 
       ! Primary field
-      fprim = eval_field(trim(field_), reader, timeavgsrc, trim(path2), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+      fprim = eval_field(trim(field_), reader, timeavgsrc, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
 
       ! Precursor field
-      fpre = eval_field(trim(field_), reader, timeavgsrc, trim(path1), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+      fpre = eval_field(trim(field_), reader, timeavgsrc, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
 
       ! Error
       ferr = f1 - (fprim - fpre)
       ferr = abs(ferr)
       error = maxval(ferr)
+      if(myrank == 0) print*, error
 
       ! Share with other ranks
       call MPI_Allreduce(error, global_error, 1, MPI_DOUBLE_PRECISION, MPI_MAX, MPI_COMM_WORLD, ierr)
@@ -601,10 +599,11 @@ contains
     integer :: sgn
     select case(trim(field))
     case('adv_x', 'adv_y', 'adv_z','ddx_p','ddy_p','ddz_p', &
-         'usgs','vsgs','wsgs','pcov','sgsTr','bouyancy')
+         'usgs','vsgs','wsgs','pcov','sgsTr', &
+         'tkeTr')
       sgn = -1
     case default
-      sgn=1
+      sgn = 1
     end select
   end function reverse_base_budget_sign
 
@@ -665,11 +664,15 @@ contains
       field_ = 'adv_z'
     case('ddx_delta_p')
       field_ = 'ddx_p'
-    case('ddj_delta_tau1j')
+    case('ddy_delta_p')
+      field_ = 'ddy_p'
+    case('ddz_delta_p')
+      field_ = 'ddz_p'
+    case('delta_usgs')
       field_ = 'usgs'
-    case('ddj_delta_tau2j')
+    case('delta_vsgs')
       field_ = 'vsgs'
-    case('ddj_delta_tau3j')
+    case('delta_wsgs')
       field_ = 'wsgs'
     case('delta_pcov')
       field_ = 'pcov'
@@ -679,6 +682,8 @@ contains
       field_ = 'sgsDiss'
     case('delta_tcov')
       field_ = 'tcov'
+    case('delta_tkeTr')
+      field_ = 'tkeTr'
     end select
 
   end subroutine deficit_field_to_time_field
@@ -707,6 +712,8 @@ contains
       if(budget_source == 2)then        
         pattern = trim(pattern)//'_deficit'
       elseif(budget_source == 3) then       
+        pattern = trim(pattern)//'_comp_deficit'
+      elseif(budget_source == 4) then       
         pattern = trim(pattern)//'_mdeficit'
       end if
       pattern = trim(pattern)//'_budget'//budget//'_term'//term//'_t*_n~.s3D'
@@ -876,7 +883,9 @@ contains
         case (2)
             fname = trim(fname) // '_deficit_budget'
         case (3)
-            fname = trim(fname) // '_mdeficit_budget'
+            fname = trim(fname) // '_comp_deficit_budget'
+        case (4)
+          fname = trim(fname) // '_mdeficit_budget'
         end select
     end if
 
@@ -905,7 +914,7 @@ contains
   case('delta_R13')
     f1 = eval_field('dup_dwp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
          eval_field('dup_bwp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
-         eval_field('dvp_bwp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
+         eval_field('dwp_bup', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
 
   case('delta_R22')
     f1 = eval_field('dvp_dvp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
@@ -919,6 +928,21 @@ contains
   case('delta_R33')
     f1 = eval_field('dwp_dwp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
      2.0*eval_field('dwp_bwp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
+
+  case('dj_d1p_bjp')
+    f1 = eval_field('ddx_dup_bup', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('ddy_dup_bvp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('ddz_dup_bwp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
+
+  case('dj_d1p_djp')
+    f1 = eval_field('ddx_dup_dup', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('ddy_dup_dvp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('ddz_dup_dwp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
+
+  case('dj_b1p_djp')
+    f1 = eval_field('ddx_dup_bup', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('ddy_dvp_bup', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('ddz_dwp_bup', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
   
   case('delta_adv_x')
     block 
@@ -931,6 +955,10 @@ contains
       bf2 = eval_field('ddy_delta_u', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
       bf3 = eval_field('ddz_delta_u', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
 
+      ! f1 = eval_field('delta_u',    reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) * bf1 + &
+      !      eval_field('delta_v',    reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) * bf2 + &
+      !      eval_field('delta_w',    reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) * bf3 
+
       f1 = eval_field('delta_u',    reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))   * &
       (bf1+eval_field('ddx_base_u', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)))  + &
            eval_field('delta_v',    reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))   * &
@@ -939,7 +967,16 @@ contains
       (bf3+eval_field('ddz_base_u', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)))  + &
         bf1*eval_field('ubar', reader, timeavgsrc, trim(path), trim(rcbase), trim(rcbase), trim(key), trim(stamp))  + &
         bf2*eval_field('vbar', reader, timeavgsrc, trim(path), trim(rcbase), trim(rcbase), trim(key), trim(stamp))  + &
-        bf3*eval_field('wbar', reader, timeavgsrc, trim(path), trim(rcbase), trim(rcbase), trim(key), trim(stamp)) 
+        bf3*eval_field('wbar', reader, timeavgsrc, trim(path), trim(rcbase), trim(rcbase), trim(key), trim(stamp)) &
+         + eval_field('ddx_dup_dup', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) &
+         + eval_field('ddy_dup_dvp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) &
+         + eval_field('ddz_dup_dwp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) &
+         + eval_field('ddx_dup_bup', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) &
+         + eval_field('ddy_dup_bvp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) &
+         + eval_field('ddz_dup_bwp', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) &
+         + eval_field('ddy_dvp_bup', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) &
+         + eval_field('ddz_dwp_bup', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) &
+         + eval_field('ddx_dup_bup', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
       deallocate(bf1, bf2, bf3)
   end block
   case('delta_adv_y')
@@ -998,10 +1035,10 @@ contains
          eval_field('ddy_base_v', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
          eval_field('ddz_base_w', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
   
-  case('ddj_delta_tau1j')
-    f1 = eval_field('ddx_delta_tau11', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
-         eval_field('ddy_delta_tau12', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
-         eval_field('ddz_delta_tau13', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
+  ! case('ddj_delta_tau1j')
+  !   f1 = eval_field('ddx_delta_tau11', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+  !        eval_field('ddy_delta_tau12', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+  !        eval_field('ddz_delta_tau13', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
 
   case('delta_pcov')
     f1 = eval_field('pcov_dd', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
@@ -1023,6 +1060,14 @@ contains
          eval_field('tcov_db', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
          eval_field('tcov_bd', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
 
+  case('delta_tkeTr')
+    f1 = eval_field('tkeTr_dbb', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+    2.d0*eval_field('tkeTr_bbd', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+    2.d0*eval_field('tkeTr_dbd', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('tkeTr_bdd', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp)) +&
+         eval_field('tkeTr_ddd', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
+
+    f1 = f1 / 2.d0
   end select
   end subroutine compute_budget_from_multiple_files
 
@@ -1086,10 +1131,16 @@ contains
         b = '0'; t = '29'
       case('tp_tp')
         b = '0'; t = '30'
+      case('bouyancy')
+        b = '0'; t = '31'
       case('adv_x')
         b = '1'; t = '01'
       case('ddx_p')
         b = '1'; t = '02'
+      case('ddy_p')
+        b = '1'; t = '06'
+      case('ddz_p')
+        b = '1'; t = '09'
       case('usgs')
         b = '1'; t = '03'
       case('turbx')
@@ -1107,9 +1158,9 @@ contains
       case('vcor')
         b = '1'; t = '13'
       case('turby')
-        b = '1'; t = '15'
-      case('bouyancy')
-        b = '1'; t = '16'  
+        b = '1'; t = '15'  
+      case('tkeTr')
+        b = '3'; t = '03'
       case('pcov')  
         b = '3'; t = '04'
       case('sgsTr')
@@ -1181,6 +1232,42 @@ contains
         b = '0'; t = '28'
       case('dwp_dTp')
         b = '0'; t = '29'
+      case('b_dj_dup')
+        b = '1'; t = '05'
+      case('d_dj_dup')
+        b = '1'; t = '06'
+      case('d_dj_bup')
+        b = '1'; t = '07'
+      case('b_dj_dvp')
+        b = '1'; t = '15'
+      case('d_dj_dvp')
+        b = '1'; t = '16'
+      case('d_dj_bvp')
+        b = '1'; t = '17'
+      case('b_dj_dwp')
+        b = '1'; t = '25'
+      case('d_dj_dwp')
+        b = '1'; t = '26'
+      case('d_dj_bwp')
+        b = '1'; t = '27'
+      case('B2_14')
+        b = '2'; t = '14'
+      case('B2_18')
+        b = '2'; t = '18'
+      case('sgsTr_dd')    
+        b = '3'; t = '05'
+      case('sgsDiss_dd')    
+        b = '3'; t = '06'
+      case('tkeTr_ddd')
+        b = '3'; t = '12'
+      case('tkeTr_bdd')
+        b = '3'; t = '13'
+      case('tkeTr_ddb')
+        b = '3'; t = '14'
+      case('B3_16')
+        b = '3'; t = '16'
+      case('tkeTr_dbd')
+        b = '3'; t = '22'
       end select
 
     elseif(budget_source == 3)then
@@ -1208,16 +1295,29 @@ contains
         b = '0'; t = '10'
       case('delta_tau33')
         b = '0'; t = '11'
-      case('delta_ucor')
+      case('delta_usgs')
         b = '0'; t = '12'
-      case('delta_vcor')
+      case('delta_vsgs')
         b = '0'; t = '13'
-      case('delta_bouyancy')
+      case('delta_wsgs')
         b = '0'; t = '14'
-      case('delta_turbx')
+      case('delta_ucor')
         b = '0'; t = '15'
-      case('delta_turby')
+      case('delta_vcor')
         b = '0'; t = '16'
+      case('delta_bouyancy')
+        b = '0'; t = '17'
+      case('ddx_delta_p')
+        b = '0'; t = '18'
+      case('ddy_delta_p')
+        b = '0'; t = '19'
+      case('ddz_delta_p')
+        b = '0'; t = '20'
+      case('delta_turbx')
+        b = '0'; t = '21'
+      case('delta_turby')
+        b = '0'; t = '22'
+
       case('dup_dup')
         b = '1'; t = '01'
       case('dup_dvp')
@@ -1248,6 +1348,163 @@ contains
         b = '1'; t = '14'
       case('dwp_bwp')
         b = '1'; t = '15'
+
+      case('d_dj_dup')
+        b = '2'; t = '01'
+      case('d_dj_dvp')
+        b = '2'; t = '02'
+      case('d_dj_dwp')
+        b = '2'; t = '03' 
+      case('d_dj_bup')
+        b = '2'; t = '04'
+      case('d_dj_bvp')
+        b = '2'; t = '05'
+      case('d_dj_bwp')
+        b = '2'; t = '06'
+      case('b_dj_dup')
+        b = '2'; t = '07'
+      case('b_dj_dvp')
+        b = '2'; t = '08'
+      case('b_dj_dwp')
+        b = '2'; t = '09'
+      case('b_dj_bup')
+        b = '2'; t = '10'
+      case('b_dj_bvp')
+        b = '2'; t = '11'
+      case('b_dj_bwp')
+        b = '2'; t = '12'
+      case('bup_dup_ddx')
+        b = '2'; t = '13'
+      case('bup_dup_ddy')
+        b = '2'; t = '14'
+      case('bup_dup_ddz')
+        b = '2'; t = '15' 
+
+      case('pcov_dd')   
+        b = '3'; t = '01'
+      case('pcov_bd')    
+        b = '3'; t = '02'
+      case('pcov_db')    
+        b = '3'; t = '03'
+      case('sgsTr_bd')    
+        b = '3'; t = '04'
+      case('sgsTr_db')    
+        b = '3'; t = '05'
+      case('sgsTr_dd')    
+        b = '3'; t = '06'
+      case('sgsDiss_db')    
+        b = '3'; t = '07'
+      case('sgsDiss_bd')    
+        b = '3'; t = '08'
+      case('sgsDiss_dd')    
+        b = '3'; t = '09'
+      case('tcov_dd')
+        b = '3'; t = '10'
+      case('tcov_db')
+        b = '3'; t = '11'
+      case('tcov_bd')
+        b = '3'; t = '12'
+      case('tkeTr_dbb')
+        b = '3'; t = '13'
+      case('tkeTr_bbd')
+        b = '3'; t = '14'
+      case('tkeTr_bdb')
+        b = '3'; t = '15'
+      case('tkeTr_dbd')
+        b = '3'; t = '16'
+      case('tkeTr_ddb')
+        b = '3'; t = '17'
+      case('tkeTr_bdd')
+        b = '3'; t = '18'
+      case('tkeTr_ddd')
+        b = '3'; t = '19'
+      case('turbcov_dd')
+        b = '3'; t = '20'
+      case('turbcov_db')
+        b = '3'; t = '21'
+      case default
+        b = '0'; t = '01'; calc = .true.     
+      end select
+
+    elseif(budget_source == 4)then
+      ! Mini deficit budgets
+      select case(trim(field))
+      case('delta_u')
+        b = '0'; t = '01'
+      case('delta_v')
+        b = '0'; t = '02'
+      case('delta_w')
+        b = '0'; t = '03'
+      case('delta_p')
+        b = '0'; t = '04'
+      case('delta_T')
+        b = '0'; t = '05'
+      case('delta_tau11')
+        b = '0'; t = '06'
+      case('delta_tau12')
+        b = '0'; t = '07'
+      case('delta_tau13')
+        b = '0'; t = '08'
+      case('delta_tau22')
+        b = '0'; t = '09'
+      case('delta_tau23')
+        b = '0'; t = '10'
+      case('delta_tau33')
+        b = '0'; t = '11'
+      case('delta_usgs')
+        b = '0'; t = '12'
+      case('delta_vsgs')
+        b = '0'; t = '13'
+      case('delta_wsgs')
+        b = '0'; t = '14'
+      case('delta_ucor')
+        b = '0'; t = '15'
+      case('delta_vcor')
+        b = '0'; t = '16'
+      case('delta_bouyancy')
+        b = '0'; t = '17'
+      case('ddx_delta_p')
+        b = '0'; t = '18'
+      case('ddy_delta_p')
+        b = '0'; t = '19'
+      case('ddz_delta_p')
+        b = '0'; t = '20'
+      case('delta_turbx')
+        b = '0'; t = '21'
+      case('delta_turby')
+        b = '0'; t = '22'
+
+      case('dup_dup')
+        b = '1'; t = '01'
+      case('dup_dvp')
+        b = '1'; t = '02'
+      case('dup_dwp')
+        b = '1'; t = '03' 
+      case('dvp_dvp')
+        b = '1'; t = '04'
+      case('dvp_dwp')
+        b = '1'; t = '05'
+      case('dwp_dwp')
+        b = '1'; t = '06'
+      case('dup_bup')
+        b = '1'; t = '07'
+      case('dup_bvp')
+        b = '1'; t = '08'
+      case('dvp_bup')
+        b = '1'; t = '09' 
+      case('dup_bwp')
+        b = '1'; t = '10'
+      case('dwp_bup')
+        b = '1'; t = '11'
+      case('dvp_bvp')
+        b = '1'; t = '12'
+      case('dvp_bwp')
+        b = '1'; t = '13'
+      case('dwp_bvp')
+        b = '1'; t = '14'
+      case('dwp_bwp')
+        b = '1'; t = '15'
+
       case('ddx_delta_u')
         b = '2'; t = '01'
       case('ddy_delta_u')
@@ -1284,30 +1541,24 @@ contains
         b = '2'; t = '17' 
       case('ddz_base_w')
         b = '2'; t = '18'
-      case('ddx_delta_p')
-        b = '3'; t = '01'
-      case('ddx_delta_tau11')
-        b = '3'; t = '02' 
-      case('ddy_delta_tau12')
-        b = '3'; t = '03'
-      case('ddz_delta_tau13')
-        b = '3'; t = '04'
+
       case('ddx_dup_dup')
-        b = '3'; t = '05'
+        b = '3'; t = '01'
       case('ddy_dup_dvp')
-        b = '3'; t = '06'
+        b = '3'; t = '02'
       case('ddz_dup_dwp')
-        b = '3'; t = '07'      
+        b = '3'; t = '03'      
       case('ddx_dup_bup')
-        b = '3'; t = '08'
+        b = '3'; t = '04'
       case('ddy_dup_bvp')
-        b = '3'; t = '09'
+        b = '3'; t = '05'
       case('ddz_dup_bwp')
-        b = '3'; t = '10'
+        b = '3'; t = '06'
       case('ddy_dvp_bup')
-        b = '3'; t = '11'
+        b = '3'; t = '07'
       case('ddz_dwp_bup')
-        b = '3'; t = '12'  
+        b = '3'; t = '08' 
+
       case('pcov_dd')   
         b = '4'; t = '01'
       case('pcov_bd')    
@@ -2142,7 +2393,7 @@ program MPIR3D_
       slice_axis, num_slice, slice_coord_, budget_source)
   else if (taskid == -1) then
     ! Miscellaneous tasks
-    call miscellaneous_driver(reader, runid, trim(field))
+    call miscellaneous_driver(reader, runid, trim(field), trim(path))
   end if
   
   if(myrank == 0) call message('Wrapping up ...')
