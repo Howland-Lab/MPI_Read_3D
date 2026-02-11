@@ -874,24 +874,23 @@ contains
     if (budget_source == 0) then
         fname = 'Run'//trim(rc)//'_'//trim(field)//'_t'//trim(key)//'.out'
     else
-        ! Budgets
-        fname = 'Run' // trim(rc)
+      ! Budgets
+      fname = 'Run' // trim(rc)
 
-        select case (budget_source)
-        case (1)
-            fname = trim(fname) // '_budget'
-        case (2)
-            fname = trim(fname) // '_deficit_budget'
-        case (3)
-            fname = trim(fname) // '_comp_deficit_budget'
-        case (4)
-          fname = trim(fname) // '_mdeficit_budget'
-        end select
-    end if
-
-    fname = trim(fname)//trim(budget)//'_term'//trim(term)// &
+      select case (budget_source)
+      case (1)
+          fname = trim(fname) // '_budget'
+      case (2)
+          fname = trim(fname) // '_deficit_budget'
+      case (3)
+          fname = trim(fname) // '_comp_deficit_budget'
+      case (4)
+        fname = trim(fname) // '_mdeficit_budget'
+      end select
+      
+      fname = trim(fname)//trim(budget)//'_term'//trim(term)// &
             '_t'//trim(key)//'_n'//trim(stamp)//'.s3D'
-
+    end if   
   end subroutine create_file_name
 
   ! Utility function to compute a field from multiple files
