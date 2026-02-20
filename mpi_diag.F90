@@ -264,9 +264,10 @@ contains
     end do
   end subroutine do_horizontal_average
   
-  subroutine ha_driver(reader, Lz, runid, path, outdir, field, budget_source)
+  subroutine ha_driver(reader, Lz, runid, path, outdir, field, budget_source, filename)
     class(FieldReader2Decomp), intent(inout) :: reader
     integer, intent(in) :: runid
+    character(*), intent(in), optional :: filename
     character(*), intent(in) :: path, outdir, field
     integer,          intent(in)  :: budget_source
     real(rk), intent(in) :: Lz    
@@ -275,6 +276,14 @@ contains
     character(len=2) :: rc
     character(len=256):: f_
     integer :: k, nx, ny, nz, xs, xe, ys, ye, zs, ze, nxloc, nyloc, nzloc
+    character(len=1024) :: filename_, outname
+    logical :: break=.false.
+
+    if(present(filename)) then
+      filename_ = trim(filename)
+    else
+      filename_ = 'null'
+    end if
 
     ! Fetch local and global sizes & start indices
     call reader%local_shape(nxloc, nyloc, nzloc)
@@ -295,9 +304,16 @@ contains
     
     do k = 1, size(sorted_keys)
 
-      f1 = eval_field(trim(field), reader, budget_source, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+      if(break) exit  ! If we read from file, no need to loop over time snapshots
 
-      if (field == 'S') then
+      if(trim(filename_) == 'null')then
+        f1 = eval_field(trim(field), reader, budget_source, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+      else
+        f1 = reader%read_field(trim(path)//'/'//trim(filename_))
+        break = .true.
+      end if
+      
+      if ((field == 'S') .and. (trim(filename_) == 'null')) then
         block
           real(rk) :: f2(nxloc, nyloc, nzloc), ws(nz), wd(nz)
 
@@ -310,16 +326,22 @@ contains
         block
           real(rk) :: profile(nz)
           call do_horizontal_average(nz, nxloc, nyloc, nzloc, zs, f1, profile)
-          call csvprofile(nz, trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//&
-                '_HA_'//trim(f_)//'.csv',z,profile)
+          if(trim(filename_) == 'null')then
+            outname = trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//&
+                '_HA_'//trim(f_)//'.csv'
+          else
+            outname = trim(outdir)//'/'//trim(filename_)//'_HA_profile.csv'
+          end if
+          call csvprofile(nz, trim(outname) ,z,profile)
         end block
       end if
     end do
   end subroutine ha_driver
 
-  subroutine slice_driver(reader, Lx, Ly, Lz, runid, path, outdir, field, axis, nslice, slice_coord, budget_source)
+  subroutine slice_driver(reader, Lx, Ly, Lz, runid, path, outdir, field, axis, nslice, slice_coord, budget_source, filename)
     class(FieldReader2Decomp), intent(inout) :: reader
     integer,          intent(in)  :: runid, nslice
+    character(*),     intent(in), optional  :: filename
     character(*),     intent(in)  :: path, outdir, field
     real(rk),         intent(in)  :: Lx, Ly, Lz, slice_coord(nslice)
     integer,          intent(in)  :: budget_source
@@ -355,11 +377,19 @@ contains
     integer :: i, j, isl, ierr, nx1, nx2, nax
     integer :: x1s, x1e, x2s, x2e, axs, axe
     real(rk) :: L1, L2, Lax, slice_
+    character(len=256) :: filename_
+    logical :: break=.false.
 
     ! Handling reference to wind speed and wind direction
     if(trim(field) == 'S')then
       if(myrank == 0) call message('ERROR(Slice): Export u and v separately and calculate WS & WD offline.')
       call MPI_Abort(MPI_COMM_WORLD, 100, ierr)
+    end if
+
+    if(present(filename)) then
+      filename_ = trim(filename)
+    else
+      filename_ = 'null'
     end if
 
     ! Convert runid to character
@@ -429,8 +459,15 @@ contains
       ! Loop over time snapshots
       do k = 1, size(sorted_keys)
 
-        f1 = eval_field(trim(field), reader, budget_source, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+        if(break) exit  ! If we read from file, no need to loop over time snapshots
 
+        if(trim(filename_) == 'null') then
+          f1 = eval_field(trim(field), reader, budget_source, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+        else
+          f1 = reader%read_field(trim(path)//'/'//trim(filename_))     
+          break=.true.     
+        end if
+        
         ! 2) Build local contributions to the two bracketing planes
         local_slice0 = 0.0_rk
         local_slice1 = 0.0_rk
@@ -484,11 +521,14 @@ contains
           end do
 
           ! Output file name
-          fname = trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//&
+          if(trim(filename_) == 'null') then
+            fname = trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//&
                     '_SL_'//trim(f_)//'_'//ax
+          else
+            fname = trim(outdir)//'/'//trim(filename_)//'_SL_'//ax            
+          end if
           if(slice_ <= -1) fname = trim(fname)//'_'//eax ! A direct index is given
-          fname = trim(fname)//'='//trim(real2string(slice_))//'.csv'
-
+          fname = trim(fname)//'='//trim(real2string(slice_))//'.csv'        
           call writeslice(nx1, nx2, trim(fname), slice_interp)
         end if
 
@@ -1067,6 +1107,7 @@ contains
          eval_field('tkeTr_ddd', reader, mbdgtsrc, trim(path), trim(rc), trim(rc), trim(key), trim(stamp))
 
     f1 = f1 / 2.d0
+
   end select
   end subroutine compute_budget_from_multiple_files
 
@@ -1270,7 +1311,7 @@ contains
       end select
 
     elseif(budget_source == 3)then
-      ! Mini deficit budgets
+      ! Compact deficit budgets
       select case(trim(field))
       case('delta_u')
         b = '0'; t = '01'
@@ -1421,6 +1462,69 @@ contains
         b = '3'; t = '20'
       case('turbcov_db')
         b = '3'; t = '21'
+
+      case('Adv_ddd')
+        b = '4'; t = '01'
+      case('Adv_ddb')
+        b = '4'; t = '02'
+      case('Adv_dbb')
+        b = '4'; t = '03'
+      case('Adv_bdd')
+        b = '4'; t = '04'
+      case('Adv_bdb')
+        b = '4'; t = '05'
+      case('prod_ddd')
+        b = '4'; t = '06'
+      case('prod_dbd')
+        b = '4'; t = '07'
+      case('prod_bdd')
+        b = '4'; t = '08'
+      case('prod_bbd')
+        b = '4'; t = '09'
+      case('prod_ddb')
+        b = '4'; t = '10'
+      case('prod_dbb')
+        b = '4'; t = '11'
+      case('prod_bdb')
+        b = '4'; t = '12'
+
+      case('adv_dudu')
+        b = '5'; t = '01'
+      case('adv_dvdu')
+        b = '5'; t = '02'
+      case('adv_dwdu')
+        b = '5'; t = '03'
+      case('adv_dubu')
+        b = '5'; t = '04'
+      case('adv_dvbu')
+        b = '5'; t = '05'
+      case('adv_dwbu')
+        b = '5'; t = '06'
+      case('adv_budu')
+        b = '5'; t = '07'
+      case('adv_bvdu')
+        b = '5'; t = '08'
+      case('adv_bwdu')
+        b = '5'; t = '09'
+      case('dx_dup_dup')
+        b = '5'; t = '16'
+      case('dy_dup_dvp')
+        b = '5'; t = '17'
+      case('dz_dup_dwp')
+        b = '5'; t = '18'
+      case('dx_dup_bup')
+        b = '5'; t = '19'
+      case('dy_dup_bvp')
+        b = '5'; t = '20'
+      case('dz_dup_bwp')
+        b = '5'; t = '21'
+      case('dx_bup_dup')
+        b = '5'; t = '22'
+      case('dy_bup_dvp')
+        b = '5'; t = '23'
+      case('dz_bup_dwp')
+        b = '5'; t = '24'    
+  
       case default
         b = '0'; t = '01'; calc = .true.     
       end select
@@ -2345,8 +2449,9 @@ program MPIR3D_
   real(rk) :: slice_coord(1000)
   real(rk), allocatable :: slice_coord_(:)
   integer :: budget_source, nxloc, nyloc, nzloc
+  character(len=256) :: filename = 'null'
   namelist /SETUP/ nx, ny, nz, Lx, Ly, Lz, path, outdir, runid, taskid, field, &
-                   slice_axis, num_slice, slice_coord, budget_source
+                   slice_axis, num_slice, slice_coord, budget_source, filename
       
   ! Initiate MPI
   ! -------------------------------------------------------------------------!
@@ -2385,11 +2490,11 @@ program MPIR3D_
 
   if (taskid == 0)then
     ! Horizontal average
-    call ha_driver(reader, Lz, runid, trim(path), trim(outdir), trim(field), budget_source)
+    call ha_driver(reader, Lz, runid, trim(path), trim(outdir), trim(field), budget_source, filename=trim(filename))
   else if (taskid == 1) then
     ! Slice
     call slice_driver(reader, Lx, Ly, Lz, runid, trim(path), trim(outdir), trim(field), &
-      slice_axis, num_slice, slice_coord_, budget_source)
+      slice_axis, num_slice, slice_coord_, budget_source, filename=trim(filename))
   else if (taskid == -1) then
     ! Miscellaneous tasks
     call miscellaneous_driver(reader, runid, trim(field), trim(path))
