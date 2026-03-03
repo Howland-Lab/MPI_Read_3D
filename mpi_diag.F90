@@ -4,6 +4,7 @@
 
 module MPIR3D
   use mpi
+  use netcdf
   use decomp_2d_io
   use decomp_2d, only: decomp_info, decomp_2d_init, xstart, &
                        xend, ystart, yend, zstart, zend, &
@@ -50,6 +51,21 @@ module MPIR3D
   end type FieldReader2Decomp
 
 contains
+
+  logical function within_range(istart, iend, tidx)
+      implicit none
+      character(*), intent(in) :: tidx
+      integer, intent(in) :: istart, iend
+      integer :: itime
+      integer :: ios
+
+      read(tidx, '(I6)', iostat=ios) itime
+      if (ios /= 0) then
+         within_range = .false.
+         return
+      end if
+      within_range = (itime >= istart .and. itime <= iend)
+   end function within_range
 
   ! Initialize the FieldReader2Decomp
   subroutine frd_init(this, nx, ny, nz)
@@ -264,9 +280,10 @@ contains
     end do
   end subroutine do_horizontal_average
   
-  subroutine ha_driver(reader, Lz, runid, path, outdir, field, budget_source, filename)
+  subroutine ha_driver(reader, Lz, runid, path, outdir, field, budget_source, start_idx, end_idx, filename)
     class(FieldReader2Decomp), intent(inout) :: reader
     integer, intent(in) :: runid
+    integer, intent(in) :: start_idx, end_idx
     character(*), intent(in), optional :: filename
     character(*), intent(in) :: path, outdir, field
     integer,          intent(in)  :: budget_source
@@ -304,6 +321,8 @@ contains
     
     do k = 1, size(sorted_keys)
 
+      if(.not. within_range(start_idx, end_idx, trim(sorted_keys(k)))) cycle
+
       if(break) exit  ! If we read from file, no need to loop over time snapshots
 
       if(trim(filename_) == 'null')then
@@ -338,9 +357,10 @@ contains
     end do
   end subroutine ha_driver
 
-  subroutine slice_driver(reader, Lx, Ly, Lz, runid, path, outdir, field, axis, nslice, slice_coord, budget_source, filename)
+  subroutine slice_driver(reader, Lx, Ly, Lz, runid, path, outdir, field, axis, nslice, slice_coord, budget_source, start_idx, end_idx, filename)
     class(FieldReader2Decomp), intent(inout) :: reader
     integer,          intent(in)  :: runid, nslice
+    integer,          intent(in)  :: start_idx, end_idx
     character(*),     intent(in), optional  :: filename
     character(*),     intent(in)  :: path, outdir, field
     real(rk),         intent(in)  :: Lx, Ly, Lz, slice_coord(nslice)
@@ -372,6 +392,7 @@ contains
     ! Slice arrays (global shape on every rank)
     real(rk), allocatable :: local_slice0(:,:), local_slice1(:,:)
     real(rk), allocatable :: global_slice0(:,:), global_slice1(:,:), slice_interp(:,:)
+    real(rk), allocatable :: x1(:), x2(:)
     real(rk), pointer :: slice_ptr(:,:)
 
     integer :: i, j, isl, ierr, nx1, nx2, nax
@@ -431,7 +452,10 @@ contains
       axs = zs; axe = ze
       eax = 'k'
     end select
-
+    
+    x1 = linspace(0.0_rk, L1, nx1)
+    x2 = linspace(0.0_rk, L2, nx2)
+    
     ! Global slice arrays (same shape on all ranks)
     allocate(local_slice0(nx1, nx2), local_slice1(nx1, nx2))
     allocate(global_slice0(nx1, nx2), global_slice1(nx1, nx2))
@@ -458,6 +482,8 @@ contains
 
       ! Loop over time snapshots
       do k = 1, size(sorted_keys)
+
+        if(.not. within_range(start_idx, end_idx, trim(sorted_keys(k)))) cycle
 
         if(break) exit  ! If we read from file, no need to loop over time snapshots
 
@@ -528,8 +554,12 @@ contains
             fname = trim(outdir)//'/'//trim(filename_)//'_SL_'//ax            
           end if
           if(slice_ <= -1) fname = trim(fname)//'_'//eax ! A direct index is given
-          fname = trim(fname)//'='//trim(real2string(slice_))//'.csv'        
-          call writeslice(nx1, nx2, trim(fname), slice_interp)
+          fname = trim(fname)//'='//trim(real2string(slice_))        
+          
+          !call writeslice(nx1, nx2, trim(fname)//'.csv', slice_interp)
+
+          !if(myrank == 0) call message('Exporting to '//trim(fname)//'.nc')
+          call export_slice_to_netcdf(trim(fname)//'.nc', trim(field), slice_interp, x1, x2, x1name, x2name)
         end if
 
         call MPI_Barrier(MPI_COMM_WORLD, ierr)
@@ -547,20 +577,140 @@ contains
     if (allocated(slice_interp))  deallocate(slice_interp)
   end subroutine slice_driver
 
-  subroutine miscellaneous_driver(reader, runid, field, path)
+    subroutine export_slice_to_netcdf(fname, varname, slice, x1, x2, x1_name, x2_name)
+      !! Export a 2D slice on a uniform grid to a NetCDF file.
+      !!
+      !! Inputs
+      !!   fname   : output NetCDF filename
+      !!   varname : variable name for the 2D field in the NetCDF file
+      !!   slice   : 2D real array, size (nx, ny)
+      !!   x1      : coordinate array for dim-1, size nx
+      !!   x2      : coordinate array for dim-2, size ny
+      !!
+      !! Notes
+      !! - Writes dimensions (x1,x2) and variable (varname) with units-free metadata.
+      !! - Uses netcdf-fortran (module netcdf).
+      !!
+      implicit none
+
+      character(len=*), intent(in) :: fname
+      character(len=*), intent(in) :: varname
+      real(rk), intent(in) :: slice(:,:)   ! (nx, ny)
+      real(rk), intent(in) :: x1(:)
+      real(rk), intent(in) :: x2(:)
+      character(len=*), intent(in), optional :: x1_name, x2_name
+
+      integer :: ncid
+      integer :: dimid_x1, dimid_x2
+      integer :: varid_x1, varid_x2, varid_f
+      integer :: nx, ny
+      integer :: ierr
+      integer :: dimids_f(2)
+      character(len=64) :: cx1, cx2
+
+      !-----------------------------------------
+      ! Defaults for coordinate names
+      !-----------------------------------------
+      if (present(x1_name)) then
+          cx1 = trim(x1_name)
+      else
+          cx1 = "x1"
+      end if
+
+      if (present(x2_name)) then
+          cx2 = trim(x2_name)
+      else
+          cx2 = "x2"
+      end if
+
+      nx = size(slice, 1)
+      ny = size(slice, 2)
+
+      if (size(x1) /= nx) error stop "x1 size mismatch"
+      if (size(x2) /= ny) error stop "x2 size mismatch"
+
+      !-----------------------------------------
+      ! Create file
+      !-----------------------------------------
+      ierr = nf90_create(trim(fname), ior(NF90_CLOBBER, NF90_NETCDF4), ncid)
+      call nc_check(ierr, "nf90_create")
+
+      !-----------------------------------------
+      ! Define dimensions
+      !-----------------------------------------
+      ierr = nf90_def_dim(ncid, trim(cx1), nx, dimid_x1)
+      call nc_check(ierr, "def_dim x1")
+
+      ierr = nf90_def_dim(ncid, trim(cx2), ny, dimid_x2)
+      call nc_check(ierr, "def_dim x2")
+
+      !-----------------------------------------
+      ! Define coordinate variables
+      !-----------------------------------------
+      ierr = nf90_def_var(ncid, trim(cx1), NF90_DOUBLE, dimid_x1, varid_x1)
+      call nc_check(ierr, "def_var x1")
+
+      ierr = nf90_def_var(ncid, trim(cx2), NF90_DOUBLE, dimid_x2, varid_x2)
+      call nc_check(ierr, "def_var x2")
+
+      !-----------------------------------------
+      ! Define field variable
+      !-----------------------------------------
+      dimids_f = [dimid_x1, dimid_x2]
+      ierr = nf90_def_var(ncid, trim(varname), NF90_DOUBLE, dimids_f, varid_f)
+      call nc_check(ierr, "def_var field")
+
+      ierr = nf90_put_att(ncid, varid_f, "long_name", trim(varname)//" slice")
+      call nc_check(ierr, "put_att field")
+
+      ierr = nf90_put_att(ncid, NF90_GLOBAL, "Conventions", "CF-1.8")
+      call nc_check(ierr, "put_att global")
+
+      ierr = nf90_enddef(ncid)
+      call nc_check(ierr, "enddef")
+
+      !-----------------------------------------
+      ! Write data
+      !-----------------------------------------
+      ierr = nf90_put_var(ncid, varid_x1, x1)
+      call nc_check(ierr, "put_var x1")
+
+      ierr = nf90_put_var(ncid, varid_x2, x2)
+      call nc_check(ierr, "put_var x2")
+
+      ierr = nf90_put_var(ncid, varid_f, slice)
+      call nc_check(ierr, "put_var slice")
+
+      ierr = nf90_close(ncid)
+      call nc_check(ierr, "close")
+
+    contains
+
+      subroutine nc_check(status, where)
+          integer, intent(in) :: status
+          character(len=*), intent(in) :: where
+          if (status /= nf90_noerr) then
+            write(*,*) "NetCDF error in ", trim(where), ": ", trim(nf90_strerror(status))
+            error stop
+          end if
+      end subroutine nc_check
+
+    end subroutine export_slice_to_netcdf
+
+  subroutine miscellaneous_driver(reader, runid, field, path, start_idx, end_idx)
     implicit none
     class(FieldReader2Decomp), intent(inout) :: reader
-    integer, intent(in) :: runid
+    integer, intent(in) :: runid, start_idx, end_idx
     character(*), intent(in) :: field, path
 
-    call verify_budgets(reader, runid, trim(field), trim(path))
+    call verify_budgets(reader, runid, trim(field), trim(path), start_idx, end_idx)
 
   end subroutine miscellaneous_driver
 
-  subroutine verify_budgets(reader, runid, field, path)
+  subroutine verify_budgets(reader, runid, field, path, start_idx, end_idx)
     implicit none
     class(FieldReader2Decomp), intent(inout) :: reader
-    integer, intent(in) :: runid
+    integer, intent(in) :: runid, start_idx, end_idx
     character(*), intent(in) :: field, path
     character(len=256) :: field_, f_
     character(len=2) :: rc, rcbase
@@ -602,6 +752,8 @@ contains
     if(myrank == 0)call message(' ')
 
     do k = 1, size(sorted_keys)
+      if(.not. within_range(start_idx, end_idx, trim(sorted_keys(k)))) cycle
+
       ! Deficit field
       f1 = eval_field(trim(field), reader, mbdgtsrc, trim(path), trim(rc), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
 
@@ -874,9 +1026,9 @@ contains
 
   ! Utility function to generate linearly spaced array
   pure function linspace(a, b, n) result(x)
-    real(kind=8), intent(in) :: a, b
+    real(rk), intent(in) :: a, b
     integer,      intent(in) :: n
-    real(kind=8), allocatable :: x(:)
+    real(rk), allocatable :: x(:)
     integer :: i
     if(allocated(x)) deallocate(x)
     if (n <= 0) then
@@ -1523,7 +1675,44 @@ contains
       case('dy_bup_dvp')
         b = '5'; t = '23'
       case('dz_bup_dwp')
-        b = '5'; t = '24'    
+        b = '5'; t = '24' 
+
+      case('adv_dudv')
+        b = '6'; t = '01'
+      case('adv_dvdv')
+        b = '6'; t = '02'
+      case('adv_dwdv')
+        b = '6'; t = '03'
+      case('adv_dubv')
+        b = '6'; t = '04'
+      case('adv_dvbv')
+        b = '6'; t = '05'
+      case('adv_dwbv')
+        b = '6'; t = '06'
+      case('adv_budv')
+        b = '6'; t = '07'
+      case('adv_bvdv')
+        b = '6'; t = '08'
+      case('adv_bwdv')
+        b = '6'; t = '09'
+      case('dx_dvp_dup')
+        b = '6'; t = '16'
+      case('dy_dvp_dvp')
+        b = '6'; t = '17'
+      case('dz_dvp_dwp')
+        b = '6'; t = '18'
+      case('dx_dvp_bup')
+        b = '6'; t = '19'
+      case('dy_dvp_bvp')
+        b = '6'; t = '20'
+      case('dz_dvp_bwp')
+        b = '6'; t = '21'
+      case('dx_bvp_dup')
+        b = '6'; t = '22'
+      case('dy_bvp_dvp')
+        b = '6'; t = '23'
+      case('dz_bvp_dwp')
+        b = '6'; t = '24'    
   
       case default
         b = '0'; t = '01'; calc = .true.     
@@ -2450,8 +2639,10 @@ program MPIR3D_
   real(rk), allocatable :: slice_coord_(:)
   integer :: budget_source, nxloc, nyloc, nzloc
   character(len=256) :: filename = 'null'
+  integer :: start_idx=0, end_idx=huge(1)
   namelist /SETUP/ nx, ny, nz, Lx, Ly, Lz, path, outdir, runid, taskid, field, &
-                   slice_axis, num_slice, slice_coord, budget_source, filename
+                   slice_axis, num_slice, slice_coord, budget_source, filename, &
+                   start_idx, end_idx
       
   ! Initiate MPI
   ! -------------------------------------------------------------------------!
@@ -2490,14 +2681,15 @@ program MPIR3D_
 
   if (taskid == 0)then
     ! Horizontal average
-    call ha_driver(reader, Lz, runid, trim(path), trim(outdir), trim(field), budget_source, filename=trim(filename))
+    call ha_driver(reader, Lz, runid, trim(path), trim(outdir), trim(field), budget_source, &
+      start_idx, end_idx, filename=trim(filename))
   else if (taskid == 1) then
     ! Slice
     call slice_driver(reader, Lx, Ly, Lz, runid, trim(path), trim(outdir), trim(field), &
-      slice_axis, num_slice, slice_coord_, budget_source, filename=trim(filename))
+      slice_axis, num_slice, slice_coord_, budget_source, start_idx, end_idx, filename=trim(filename))
   else if (taskid == -1) then
     ! Miscellaneous tasks
-    call miscellaneous_driver(reader, runid, trim(field), trim(path))
+    call miscellaneous_driver(reader, runid, trim(field), trim(path), start_idx, end_idx)
   end if
   
   if(myrank == 0) call message('Wrapping up ...')
