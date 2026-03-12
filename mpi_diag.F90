@@ -107,15 +107,15 @@ contains
     call MPI_Gather(loc, 6, MPI_INTEGER, recvbuf, 6, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
 
     ! Print local extents
-    if (myrank == 0) then      
-      do r = 0, nprocs-1
-        off = 6*r
-        write(buf,'("FRD_INIT: Rank=",I0," X: ",I0,", ",I0," // Y: ",I0,", ",I0," // Z: ",I0,", ",I0)') &
-            r, recvbuf(off+1), recvbuf(off+2), recvbuf(off+3), recvbuf(off+4), recvbuf(off+5), recvbuf(off+6)
-        call message(trim(buf))
-      end do
-      deallocate(recvbuf)
-    end if
+    ! if (myrank == 0) then      
+    !   do r = 0, nprocs-1
+    !     off = 6*r
+    !     write(buf,'("FRD_INIT: Rank=",I0," X: ",I0,", ",I0," // Y: ",I0,", ",I0," // Z: ",I0,", ",I0)') &
+    !         r, recvbuf(off+1), recvbuf(off+2), recvbuf(off+3), recvbuf(off+4), recvbuf(off+5), recvbuf(off+6)
+    !     call message(trim(buf))
+    !   end do
+    !   deallocate(recvbuf)
+    ! end if
     
     this%is_init = .true.
 
@@ -374,7 +374,7 @@ contains
     integer :: nx, ny, nz
     integer :: nxloc, nyloc, nzloc
     integer :: xs, xe, ys, ye, zs, ze
-
+    
     ! Global coordinates
     ! real(rk), allocatable :: x1(:), x2(:)
 
@@ -388,6 +388,7 @@ contains
 
     ! Time keys
     character(len=:), allocatable :: sorted_keys(:), sorted_stamps(:)
+    integer :: num_stamps
 
     ! Slice arrays (global shape on every rank)
     real(rk), allocatable :: local_slice0(:,:), local_slice1(:,:)
@@ -399,7 +400,7 @@ contains
     integer :: x1s, x1e, x2s, x2e, axs, axe
     real(rk) :: L1, L2, Lax, slice_
     character(len=256) :: filename_
-    logical :: break=.false.
+    logical :: filemode = .false.
 
     ! Handling reference to wind speed and wind direction
     if(trim(field) == 'S')then
@@ -412,6 +413,7 @@ contains
     else
       filename_ = 'null'
     end if
+    filemode = trim(filename_) == 'null'
 
     ! Convert runid to character
     write(rc, '(I2.2)') runid
@@ -426,8 +428,13 @@ contains
     allocate(f1(nxloc, nyloc, nzloc))
 
     ! Get file list and sort by time
-    call get_keys_stamps(trim(path), trim(rc), budget_source, trim(field), f_, sorted_keys, sorted_stamps)
-    
+    if(filemode)then
+      call get_keys_stamps(trim(path), trim(rc), budget_source, trim(field), f_, sorted_keys, sorted_stamps)
+      num_stamps = size(sorted_keys)
+    else
+      num_stamps = 1
+    end if
+
     ! Figure which coordinate names to use
     select case (ax)
     case ('x')
@@ -481,17 +488,13 @@ contains
       end if
 
       ! Loop over time snapshots
-      do k = 1, size(sorted_keys)
+      do k = 1, num_stamps
 
-        if(.not. within_range(start_idx, end_idx, trim(sorted_keys(k)))) cycle
-
-        if(break) exit  ! If we read from file, no need to loop over time snapshots
-
-        if(trim(filename_) == 'null') then
-          f1 = eval_field(trim(field), reader, budget_source, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+        if(filemode)then
+          f1 = reader%read_field(trim(path)//'/'//trim(filename_))
         else
-          f1 = reader%read_field(trim(path)//'/'//trim(filename_))     
-          break=.true.     
+          if(.not. within_range(start_idx, end_idx, trim(sorted_keys(k)))) cycle
+          f1 = eval_field(trim(field), reader, budget_source, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
         end if
         
         ! 2) Build local contributions to the two bracketing planes
@@ -547,7 +550,7 @@ contains
           end do
 
           ! Output file name
-          if(trim(filename_) == 'null') then
+          if(filemode) then
             fname = trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//&
                     '_SL_'//trim(f_)//'_'//ax
           else
@@ -557,8 +560,6 @@ contains
           fname = trim(fname)//'='//trim(real2string(slice_))        
           
           !call writeslice(nx1, nx2, trim(fname)//'.csv', slice_interp)
-
-          !if(myrank == 0) call message('Exporting to '//trim(fname)//'.nc')
           call export_slice_to_netcdf(trim(fname)//'.nc', trim(field), slice_interp, x1, x2, x1name, x2name)
         end if
 
@@ -577,7 +578,200 @@ contains
     if (allocated(slice_interp))  deallocate(slice_interp)
   end subroutine slice_driver
 
-    subroutine export_slice_to_netcdf(fname, varname, slice, x1, x2, x1_name, x2_name)
+  subroutine compute_abl(reader, Lx, Ly, Lz, runid, baserunid, path, outdir, start_idx, end_idx)
+    implicit none
+    class(FieldReader2Decomp), intent(inout) :: reader
+    integer,          intent(in)  :: runid, baserunid
+    integer,          intent(in)  :: start_idx, end_idx
+    real(rk),         intent(in)  :: Lx, Ly, Lz
+    character(*),     intent(in)  :: path, outdir    
+    character(len=2) :: rc, rcbase
+    integer :: nx, ny, nz
+    integer :: nxloc, nyloc, nzloc
+    integer :: xs, xe, ys, ye, zs, ze  
+    real(rk), allocatable :: uw(:,:,:), vw(:,:,:), buffer(:,:,:), zcross(:,:), zcross_global(:,:)
+    real(rk), allocatable :: x(:), y(:), z(:)
+    real(rk) :: dz
+    character(len=256) :: f_, fname
+    character(len=:), allocatable :: sorted_keys(:), sorted_stamps(:)
+    integer :: k, ierr
+    
+    ! Convert runid to character
+    write(rc, '(I2.2)') runid
+    write(rcbase, '(I2.2)') baserunid
+
+    ! Shapes and local indices
+    call reader%local_shape(nxloc, nyloc, nzloc)
+    call reader%global_shape(nx, ny, nz)
+    call reader%indices(xs, xe, ys, ye, zs, ze)
+    allocate(uw(nxloc, nyloc, nzloc))
+    allocate(vw(nxloc, nyloc, nzloc))
+    allocate(buffer(nxloc, nyloc, nzloc))
+    allocate(zcross(nx, ny))
+    allocate(zcross_global(nx, ny))
+    
+    x = linspace(0.0_rk, Lx, nx) 
+    y = linspace(0.0_rk, Ly, ny) 
+    dz = Lz/nz
+    z = linspace(dz/2.0_rk, Lz-dz/2.0_rk, nz)
+
+    call get_keys_stamps(trim(path), trim(rc), 3, 'dup_dwp', f_, sorted_keys, sorted_stamps)
+    
+    ! Loop over time snapshots
+    do k = 1, size(sorted_keys)
+
+      if(.not. within_range(start_idx, end_idx, trim(sorted_keys(k)))) cycle
+
+      uw = 0.0_rk
+      vw = 0.0_rk
+      zcross = 0.0_rk
+      zcross_global = 0.0_rk
+
+      ! u'w'
+      buffer = eval_field('R13', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+      uw = uw + buffer
+
+      buffer = eval_field('dup_dwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+      uw = uw + buffer
+
+      buffer = eval_field('dup_bwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+      uw = uw + buffer
+
+      buffer = eval_field('dwp_bup', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+      uw = uw + buffer
+
+      buffer = eval_field('tau13', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+      uw = uw + buffer
+
+      buffer = eval_field('delta_tau13', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+      uw = uw + buffer
+
+      ! v'w'
+      buffer = eval_field('R23', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+      vw = vw + buffer
+
+      buffer = eval_field('dvp_dwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+      vw = vw + buffer
+
+      buffer = eval_field('dvp_bwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+      vw = vw + buffer
+
+      buffer = eval_field('dwp_bvp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+      vw = vw + buffer
+
+      buffer = eval_field('tau23', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+      vw = vw + buffer
+
+      buffer = eval_field('delta_tau23', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+      vw = vw + buffer
+
+      ! Shear magnitude
+      buffer = sqrt(uw**2 + vw**2)
+
+      ! ABL height
+      call find_threshold_crossing_z(buffer, z, zcross(xs:xe, ys:ye), 0.05_rk, 0.0_rk)
+
+      ! MPI exchange
+      call MPI_Allreduce(zcross, zcross_global, nx*ny, MPI_DOUBLE_PRECISION, &
+                    MPI_SUM, MPI_COMM_WORLD, ierr)
+
+      fname = trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//'_SL_BLH.nc' 
+      call export_slice_to_netcdf(trim(fname), 'BLH', zcross_global, x, y, 'x', 'y')
+    end do
+  end subroutine
+
+  subroutine find_threshold_crossing_z(field, z, zcross, threshold, missing_value)
+    implicit none
+
+    !-----------------------------------------------------------------
+    ! Inputs
+    !-----------------------------------------------------------------
+    real(rk), intent(in)  :: field(:,:,:)      ! 3D field: (nx, ny, nz)
+    real(rk), intent(in)  :: z(:)              ! z locations, size nz
+
+    ! Optional inputs
+    real(rk), intent(in), optional :: threshold      ! default = 0.05
+    real(rk), intent(in), optional :: missing_value  ! default = -huge(1.0)
+
+    !-----------------------------------------------------------------
+    ! Output
+    !-----------------------------------------------------------------
+    real(rk), intent(out) :: zcross(size(field,1), size(field,2))
+
+    !-----------------------------------------------------------------
+    ! Local variables
+    !-----------------------------------------------------------------
+    integer :: nx, ny, nz
+    integer :: i, j, k
+    real(rk)    :: thr, miss
+    real(rk)    :: fref, fthr
+    real(rk)    :: f1, f2
+    real(rk)    :: z1, z2
+    real(rk)    :: alpha
+    logical :: found
+
+    nx = size(field,1)
+    ny = size(field,2)
+    nz = size(field,3)
+
+    ! Defaults
+    thr  = 0.05
+    if (present(threshold)) thr = threshold
+
+    miss = 0.0_rk
+    if (present(missing_value)) miss = missing_value
+
+    ! Basic sanity check
+    if (size(z) /= nz) then
+      stop "Error in find_threshold_crossing_z: size(z) must equal size(field,3)"
+    end if
+
+    ! Initialize output
+    zcross = miss
+
+    do j = 1, ny
+      do i = 1, nx
+        fref = field(i,j,1)
+        fthr = thr * fref
+        found = .false.
+
+        ! Handle case where the first point is already below threshold
+        if (field(i,j,1) <= fthr) then
+            zcross(i,j) = z(1)
+            cycle
+        end if
+
+        ! Search for first crossing
+        do k = 2, nz
+          if (field(i,j,k) <= fthr) then
+            f1 = field(i,j,k-1)
+            f2 = field(i,j,k)
+            z1 = z(k-1)
+            z2 = z(k)
+
+            ! Linear interpolation:
+            ! f(zcross) = fthr
+            if (abs(f2 - f1) > tiny(1.0)) then
+                alpha = (fthr - f1) / (f2 - f1)
+                zcross(i,j) = z1 + alpha * (z2 - z1)
+            else
+                ! Degenerate case: identical consecutive values
+                zcross(i,j) = z1
+            end if
+
+            found = .true.
+            exit
+          end if
+        end do
+
+        if (.not. found) then
+            zcross(i,j) = miss
+        end if
+      end do
+    end do
+  end subroutine find_threshold_crossing_z
+
+  subroutine export_slice_to_netcdf(fname, varname, slice, x1, x2, x1_name, x2_name)
       !! Export a 2D slice on a uniform grid to a NetCDF file.
       !!
       !! Inputs
@@ -2690,6 +2884,8 @@ program MPIR3D_
   else if (taskid == -1) then
     ! Miscellaneous tasks
     call miscellaneous_driver(reader, runid, trim(field), trim(path), start_idx, end_idx)
+  else if (taskid == 2)then
+    call compute_abl(reader, Lx, Ly, Lz, runid, runid-1, trim(path), trim(outdir), start_idx, end_idx)
   end if
   
   if(myrank == 0) call message('Wrapping up ...')
