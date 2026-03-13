@@ -616,7 +616,7 @@ contains
     z = linspace(dz/2.0_rk, Lz-dz/2.0_rk, nz)
 
     if(budget_source == 1)then
-      call get_keys_stamps(trim(path), trim(rc), 3, 'R13', f_, sorted_keys, sorted_stamps)
+      call get_keys_stamps(trim(path), trim(rc), 1, 'R13', f_, sorted_keys, sorted_stamps)
     else
       call get_keys_stamps(trim(path), trim(rc), 3, 'dup_dwp', f_, sorted_keys, sorted_stamps)
     end if   
