@@ -592,7 +592,7 @@ contains
     real(rk), allocatable :: uw(:,:,:), vw(:,:,:), buffer(:,:,:), zcross(:,:), zcross_global(:,:)
     real(rk), allocatable :: x(:), y(:), z(:)
     real(rk) :: dz
-    character(len=256) :: f_, fname
+    character(len=256) :: f_, fname, Lxc, Lyc, Lzc
     character(len=:), allocatable :: sorted_keys(:), sorted_stamps(:)
     integer :: k, ierr
     
@@ -614,6 +614,15 @@ contains
     y = linspace(0.0_rk, Ly, ny) 
     dz = Lz/nz
     z = linspace(dz/2.0_rk, Lz-dz/2.0_rk, nz)
+
+    if (myrank == 0) then
+      write(Lxc, '(A)') Lx
+      call message('Domain length is '//trim(Lxc))
+      write(Lyc, '(A)') Ly
+      call message('Domain width is '//trim(Lyc))
+      write(Lzc, '(A)') Lz
+      call message('Domain length is '//trim(Lzc))
+    end if
 
     if(budget_source == 1)then
       call get_keys_stamps(trim(path), trim(rc), 1, 'R13', f_, sorted_keys, sorted_stamps)
@@ -697,6 +706,8 @@ contains
                     MPI_SUM, MPI_COMM_WORLD, ierr)
 
       fname = trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//'_SL_BLH.nc' 
+      if(myrank == 0) call message('Exporting to: '//trim(fname))
+
       call export_slice_to_netcdf(trim(fname), 'BLH', zcross_global, x, y, 'x', 'y')
     end do
   end subroutine
