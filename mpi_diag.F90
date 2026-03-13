@@ -75,7 +75,7 @@ contains
     character(256) :: buf
     integer :: loc(6)
     integer, allocatable :: recvbuf(:)
-    integer :: r, off
+    !integer :: r, off
 
     this%nx = nx; this%ny = ny; this%nz = nz
     if (myrank == 0) allocate(recvbuf(6*nprocs))
@@ -578,11 +578,11 @@ contains
     if (allocated(slice_interp))  deallocate(slice_interp)
   end subroutine slice_driver
 
-  subroutine compute_abl(reader, Lx, Ly, Lz, runid, baserunid, path, outdir, start_idx, end_idx)
+  subroutine compute_abl(reader, Lx, Ly, Lz, runid, baserunid, budget_source, path, outdir, start_idx, end_idx)
     implicit none
     class(FieldReader2Decomp), intent(inout) :: reader
     integer,          intent(in)  :: runid, baserunid
-    integer,          intent(in)  :: start_idx, end_idx
+    integer,          intent(in)  :: start_idx, end_idx, budget_source
     real(rk),         intent(in)  :: Lx, Ly, Lz
     character(*),     intent(in)  :: path, outdir    
     character(len=2) :: rc, rcbase
@@ -615,7 +615,11 @@ contains
     dz = Lz/nz
     z = linspace(dz/2.0_rk, Lz-dz/2.0_rk, nz)
 
-    call get_keys_stamps(trim(path), trim(rc), 3, 'dup_dwp', f_, sorted_keys, sorted_stamps)
+    if(budget_source == 1)then
+      call get_keys_stamps(trim(path), trim(rc), 3, 'R13', f_, sorted_keys, sorted_stamps)
+    else
+      call get_keys_stamps(trim(path), trim(rc), 3, 'dup_dwp', f_, sorted_keys, sorted_stamps)
+    end if   
     
     ! Loop over time snapshots
     do k = 1, size(sorted_keys)
@@ -627,43 +631,60 @@ contains
       zcross = 0.0_rk
       zcross_global = 0.0_rk
 
-      ! u'w'
-      buffer = eval_field('R13', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-      uw = uw + buffer
+      if(budget_source == 1)then
+        ! u'w'
+        buffer = eval_field('R13', reader, 1, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+        uw = uw + buffer
 
-      buffer = eval_field('dup_dwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-      uw = uw + buffer
+        buffer = eval_field('tau13', reader, 1, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+        uw = uw + buffer
 
-      buffer = eval_field('dup_bwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-      uw = uw + buffer
+        ! v'w'
+        buffer = eval_field('R23', reader, 1, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+        vw = vw + buffer
 
-      buffer = eval_field('dwp_bup', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-      uw = uw + buffer
+        buffer = eval_field('tau23', reader, 1, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+        vw = vw + buffer
 
-      buffer = eval_field('tau13', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-      uw = uw + buffer
+      else
+        ! u'w'
+        buffer = eval_field('R13', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+        uw = uw + buffer
 
-      buffer = eval_field('delta_tau13', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-      uw = uw + buffer
+        buffer = eval_field('dup_dwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+        uw = uw + buffer
 
-      ! v'w'
-      buffer = eval_field('R23', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-      vw = vw + buffer
+        buffer = eval_field('dup_bwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+        uw = uw + buffer
 
-      buffer = eval_field('dvp_dwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-      vw = vw + buffer
+        buffer = eval_field('dwp_bup', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+        uw = uw + buffer
 
-      buffer = eval_field('dvp_bwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-      vw = vw + buffer
+        buffer = eval_field('tau13', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+        uw = uw + buffer
 
-      buffer = eval_field('dwp_bvp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-      vw = vw + buffer
+        buffer = eval_field('delta_tau13', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+        uw = uw + buffer
 
-      buffer = eval_field('tau23', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-      vw = vw + buffer
+        ! v'w'
+        buffer = eval_field('R23', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+        vw = vw + buffer
 
-      buffer = eval_field('delta_tau23', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-      vw = vw + buffer
+        buffer = eval_field('dvp_dwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+        vw = vw + buffer
+
+        buffer = eval_field('dvp_bwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+        vw = vw + buffer
+
+        buffer = eval_field('dwp_bvp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+        vw = vw + buffer
+
+        buffer = eval_field('tau23', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+        vw = vw + buffer
+
+        buffer = eval_field('delta_tau23', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+        vw = vw + buffer
+      end if     
 
       ! Shear magnitude
       buffer = sqrt(uw**2 + vw**2)
@@ -2885,7 +2906,7 @@ program MPIR3D_
     ! Miscellaneous tasks
     call miscellaneous_driver(reader, runid, trim(field), trim(path), start_idx, end_idx)
   else if (taskid == 2)then
-    call compute_abl(reader, Lx, Ly, Lz, runid, runid-1, trim(path), trim(outdir), start_idx, end_idx)
+    call compute_abl(reader, Lx, Ly, Lz, runid, runid-1, budget_source, trim(path), trim(outdir), start_idx, end_idx)
   end if
   
   if(myrank == 0) call message('Wrapping up ...')
