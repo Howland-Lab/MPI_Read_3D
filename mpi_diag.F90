@@ -578,11 +578,11 @@ contains
     if (allocated(slice_interp))  deallocate(slice_interp)
   end subroutine slice_driver
 
-  subroutine compute_abl(reader, Lx, Ly, Lz, runid, baserunid, budget_source, path, outdir, start_idx, end_idx)
+  subroutine compute_abl(reader, Lx, Ly, Lz, runid, baserunid, budget_source, abl_type, path, outdir, start_idx, end_idx)
     implicit none
     class(FieldReader2Decomp), intent(inout) :: reader
     integer,          intent(in)  :: runid, baserunid
-    integer,          intent(in)  :: start_idx, end_idx, budget_source
+    integer,          intent(in)  :: start_idx, end_idx, budget_source, abl_type
     real(rk),         intent(in)  :: Lx, Ly, Lz
     character(*),     intent(in)  :: path, outdir    
     character(len=2) :: rc, rcbase
@@ -594,6 +594,7 @@ contains
     real(rk) :: dz
     character(len=256) :: f_, fname, Lxc, Lyc, Lzc
     character(len=:), allocatable :: sorted_keys(:), sorted_stamps(:)
+    character(1) :: method
     integer :: k, ierr
     
     ! Convert runid to character
@@ -621,7 +622,7 @@ contains
       write(Lyc, '(F10.3)') Ly
       call message('Domain width is '//trim(Lyc))
       write(Lzc, '(F10.3)') Lz
-      call message('Domain length is '//trim(Lzc))
+      call message('Domain height is '//trim(Lzc))
     end if
 
     if(budget_source == 1)then
@@ -637,78 +638,160 @@ contains
 
       uw = 0.0_rk
       vw = 0.0_rk
+      buffer = 0.0_rk
       zcross = 0.0_rk
       zcross_global = 0.0_rk
 
-      if(budget_source == 1)then
-        ! u'w'
-        buffer = eval_field('R13', reader, 1, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-        uw = uw + buffer
+      if(abl_type == 0)then
+        if(budget_source == 1)then
+          ! u'w'
+          buffer = eval_field('R13', reader, 1, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+          uw = uw + buffer
 
-        buffer = eval_field('tau13', reader, 1, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-        uw = uw + buffer
+          buffer = eval_field('tau13', reader, 1, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+          uw = uw + buffer
 
-        ! v'w'
-        buffer = eval_field('R23', reader, 1, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-        vw = vw + buffer
+          ! v'w'
+          buffer = eval_field('R23', reader, 1, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+          vw = vw + buffer
 
-        buffer = eval_field('tau23', reader, 1, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-        vw = vw + buffer
+          buffer = eval_field('tau23', reader, 1, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+          vw = vw + buffer
 
-      else
-        ! u'w'
-        buffer = eval_field('R13', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-        uw = uw + buffer
+        else
+          ! u'w'
+          buffer = eval_field('R13', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+          uw = uw + buffer
 
-        buffer = eval_field('dup_dwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-        uw = uw + buffer
+          buffer = eval_field('dup_dwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+          uw = uw + buffer
 
-        buffer = eval_field('dup_bwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-        uw = uw + buffer
+          buffer = eval_field('dup_bwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+          uw = uw + buffer
 
-        buffer = eval_field('dwp_bup', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-        uw = uw + buffer
+          buffer = eval_field('dwp_bup', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+          uw = uw + buffer
 
-        buffer = eval_field('tau13', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-        uw = uw + buffer
+          buffer = eval_field('tau13', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+          uw = uw + buffer
 
-        buffer = eval_field('delta_tau13', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-        uw = uw + buffer
+          buffer = eval_field('delta_tau13', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+          uw = uw + buffer
 
-        ! v'w'
-        buffer = eval_field('R23', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-        vw = vw + buffer
+          ! v'w'
+          buffer = eval_field('R23', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+          vw = vw + buffer
 
-        buffer = eval_field('dvp_dwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-        vw = vw + buffer
+          buffer = eval_field('dvp_dwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+          vw = vw + buffer
 
-        buffer = eval_field('dvp_bwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-        vw = vw + buffer
+          buffer = eval_field('dvp_bwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+          vw = vw + buffer
 
-        buffer = eval_field('dwp_bvp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-        vw = vw + buffer
+          buffer = eval_field('dwp_bvp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+          vw = vw + buffer
 
-        buffer = eval_field('tau23', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-        vw = vw + buffer
+          buffer = eval_field('tau23', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+          vw = vw + buffer
 
-        buffer = eval_field('delta_tau23', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-        vw = vw + buffer
-      end if     
+          buffer = eval_field('delta_tau23', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+          vw = vw + buffer
+        end if
 
-      ! Shear magnitude
-      buffer = sqrt(uw**2 + vw**2)
+        ! Shear magnitude
+        buffer = sqrt(uw**2 + vw**2)
 
-      ! ABL height
-      call find_threshold_crossing_z(buffer, z, zcross(xs:xe, ys:ye), 0.05_rk, 0.0_rk)
+        ! ABL height
+        call find_threshold_crossing_z(buffer, z, zcross(xs:xe, ys:ye), 0.05_rk, 0.0_rk)
+      else if (abl_type == 1)then
+
+        ! Read temperature vertical gradient
+        if(budget_source == 1)then
+          buffer = reader%read_field(trim(path)//'/ddz_Run'//trim(rc)//'_budget0_term26_t'//trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D')
+        else
+          ! Base
+          uw = reader%read_field(trim(path)//'/ddz_Run'//trim(rcbase)//'_budget0_term26_t'//trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D')
+          buffer = buffer + uw
+
+          uw = reader%read_field(trim(path)//'/ddz_Run'//trim(rc)//'_comp_deficit_budget0_term05_t'//trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D')
+          buffer = buffer + uw
+        end if 
+
+        ! Now buffer holds d(theta)/dz
+        call find_capping_inversion(buffer, z, zcross(xs:xe, ys:ye), 0.15_rk)       
+      end if 
 
       ! MPI exchange
       call MPI_Allreduce(zcross, zcross_global, nx*ny, MPI_DOUBLE_PRECISION, &
                     MPI_SUM, MPI_COMM_WORLD, ierr)
 
-      fname = trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//'_SL_BLH.nc' 
+      write(method, '(I1.1)')abl_type
+      fname = trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//'_SL_BLH_M'//method//'.nc' 
       if(myrank == 0) call message('Exporting to: '//trim(fname))
 
       call export_slice_to_netcdf(trim(fname), 'BLH', zcross_global, x, y, 'x', 'y')
+    end do
+  end subroutine
+
+  subroutine find_capping_inversion(field, z, zcross, alpha)
+    implicit none
+    real(rk), intent(in)  :: field(:,:,:)      ! 3D field: (nx, ny, nz)
+    real(rk), intent(in)  :: z(:)              ! z locations, size nz
+    real(rk), intent(in), optional :: alpha  
+    real(rk), intent(out) :: zcross(size(field,1), size(field,2))
+    real(rk) :: alpha_, max_dthetadz
+    integer :: nx, ny, nz
+    integer :: i, j, k, izmax
+    real(rk) :: zstop
+    real(rk) :: Gbg, thr
+    integer :: count
+
+    nx = size(field,1)
+    ny = size(field,2)
+    nz = size(field,3)
+
+    ! Basic sanity check
+    if (size(z) /= nz) then
+      stop "Error in find_capping_inversion: size(z) must equal size(field,3)"
+    end if
+
+    ! Defaults
+    alpha_  = 0.15
+    if (present(alpha)) alpha_ = alpha
+
+    zcross = 0.0_rk
+    do j = 1, ny
+      do i = 1, nx
+        ! find maximum
+        max_dthetadz = field(i,j,1)
+        izmax = 1
+        do k=2, nz
+          if(field(i,j,k) > max_dthetadz)then
+            max_dthetadz=field(i,j,k)
+            izmax = k
+          end if
+        end do
+
+        ! Near-surface mean
+        count = 0
+        Gbg = 0.0_rk
+        zstop = z(izmax) * 0.2_rk
+        do k=2,nz
+          if(z(k) > zstop) exit
+          count = count + 1
+          Gbg = Gbg + field(i,j,k)
+        end do
+        Gbg = Gbg / max(1.0_rk, real(count, rk))
+        thr = Gbg + alpha_ * (max_dthetadz - Gbg)
+
+        ! Find first crossing
+        do k=1, izmax
+          if(field(i,j,k) > thr)then
+            zcross(i,j) = z(k)
+            exit
+          end if
+        end do        
+      end do
     end do
   end subroutine
 
@@ -2856,7 +2939,7 @@ program MPIR3D_
   integer :: ierr
   character(len=256) :: path, outdir
   character(len=256) :: field
-  integer:: nx=1, ny=1, nz=1, runid=1, taskid=0, num_slice=1
+  integer:: nx=1, ny=1, nz=1, runid=1, taskid=0, num_slice=1, abl_type=0
   real(rk):: Lx=1.0_rk, Ly=1.0_rk, Lz=1.0_rk
   integer :: nlen, ioUnit=28
   character(:), allocatable :: inputfile
@@ -2868,7 +2951,7 @@ program MPIR3D_
   integer :: start_idx=0, end_idx=huge(1)
   namelist /SETUP/ nx, ny, nz, Lx, Ly, Lz, path, outdir, runid, taskid, field, &
                    slice_axis, num_slice, slice_coord, budget_source, filename, &
-                   start_idx, end_idx
+                   start_idx, end_idx, abl_type
       
   ! Initiate MPI
   ! -------------------------------------------------------------------------!
@@ -2917,7 +3000,7 @@ program MPIR3D_
     ! Miscellaneous tasks
     call miscellaneous_driver(reader, runid, trim(field), trim(path), start_idx, end_idx)
   else if (taskid == 2)then
-    call compute_abl(reader, Lx, Ly, Lz, runid, runid-1, budget_source, trim(path), trim(outdir), start_idx, end_idx)
+    call compute_abl(reader, Lx, Ly, Lz, runid, runid-1, budget_source, abl_type, trim(path), trim(outdir), start_idx, end_idx)
   end if
   
   if(myrank == 0) call message('Wrapping up ...')
