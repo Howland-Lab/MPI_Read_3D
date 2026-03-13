@@ -616,11 +616,11 @@ contains
     z = linspace(dz/2.0_rk, Lz-dz/2.0_rk, nz)
 
     if (myrank == 0) then
-      write(Lxc, '(A)') Lx
+      write(Lxc, '(F10.3)') Lx
       call message('Domain length is '//trim(Lxc))
-      write(Lyc, '(A)') Ly
+      write(Lyc, '(F10.3)') Ly
       call message('Domain width is '//trim(Lyc))
-      write(Lzc, '(A)') Lz
+      write(Lzc, '(F10.3)') Lz
       call message('Domain length is '//trim(Lzc))
     end if
 
