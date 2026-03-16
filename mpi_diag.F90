@@ -413,7 +413,7 @@ contains
     else
       filename_ = 'null'
     end if
-    filemode = trim(filename_) == 'null'
+    filemode = .not.(trim(filename_) == 'null')
 
     ! Convert runid to character
     write(rc, '(I2.2)') runid
@@ -428,7 +428,7 @@ contains
     allocate(f1(nxloc, nyloc, nzloc))
 
     ! Get file list and sort by time
-    if(filemode)then
+    if(.not. filemode)then
       call get_keys_stamps(trim(path), trim(rc), budget_source, trim(field), f_, sorted_keys, sorted_stamps)
       num_stamps = size(sorted_keys)
     else
@@ -550,7 +550,7 @@ contains
           end do
 
           ! Output file name
-          if(filemode) then
+          if(.not. filemode) then
             fname = trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//&
                     '_SL_'//trim(f_)//'_'//ax
           else
@@ -734,6 +734,7 @@ contains
   end subroutine
 
   subroutine find_capping_inversion(field, z, zcross, alpha)
+    ! This suborutine should be used with a single process
     implicit none
     real(rk), intent(in)  :: field(:,:,:)      ! 3D field: (nx, ny, nz)
     real(rk), intent(in)  :: z(:)              ! z locations, size nz
@@ -763,34 +764,35 @@ contains
     do j = 1, ny
       do i = 1, nx
         ! find maximum
-        max_dthetadz = field(i,j,1)
-        izmax = 1
-        do k=2, nz
+        max_dthetadz = field(i,j,2)
+        izmax = 2
+        do k=3, nz
           if(field(i,j,k) > max_dthetadz)then
             max_dthetadz=field(i,j,k)
             izmax = k
           end if
         end do
-
+        
         ! Near-surface mean
-        count = 0
-        Gbg = 0.0_rk
-        zstop = z(izmax) * 0.2_rk
-        do k=2,nz
+        count = 1
+        Gbg = field(i,j,2)
+        zstop = z(izmax) * 0.3_rk
+        do k=3,nz
           if(z(k) > zstop) exit
           count = count + 1
           Gbg = Gbg + field(i,j,k)
         end do
-        Gbg = Gbg / max(1.0_rk, real(count, rk))
+        Gbg = Gbg / real(count, rk)
         thr = Gbg + alpha_ * (max_dthetadz - Gbg)
 
         ! Find first crossing
-        do k=1, izmax
+        do k=3, izmax
           if(field(i,j,k) > thr)then
             zcross(i,j) = z(k)
             exit
           end if
-        end do        
+        end do  
+        
       end do
     end do
   end subroutine
