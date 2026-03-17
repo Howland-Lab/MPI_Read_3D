@@ -578,6 +578,143 @@ contains
     if (allocated(slice_interp))  deallocate(slice_interp)
   end subroutine slice_driver
 
+  subroutine one_d_profile(reader, Lx, Ly, Lz, runid, budget_source, path, outdir, &
+        field, start_idx, end_idx, filename, axis, x1, x2, y1, y2, z1, z2)
+    implicit none
+    class(FieldReader2Decomp), intent(inout) :: reader
+    integer,          intent(in)  :: runid
+    integer,          intent(in)  :: start_idx, end_idx, budget_source
+    real(rk),         intent(in)  :: Lx, Ly, Lz, x1, x2, y1, y2, z1, z2
+    character(*),     intent(in)  :: path, outdir, filename, field
+    character(1),     intent(in)  :: axis  
+    character(1) :: ax
+    character(len=2) :: rc
+    integer :: nx, ny, nz
+    integer :: nxloc, nyloc, nzloc
+    integer :: xs, xe, ys, ye, zs, ze  
+    character(len=:), allocatable :: sorted_keys(:), sorted_stamps(:)
+    real(rk), allocatable, target :: f(:,:,:)
+    real(rk), allocatable :: mask(:,:,:), xi(:), local_sum(:), global_sum(:)
+    real(rk), dimension(:,:), pointer :: f_slice
+    character(len=512) :: f_
+    logical :: filemode = .false.
+    integer :: num_stamps, ni, i, j, k, kstart, kend, ierr, istamp
+    character(len=512) :: outname
+    real(rk) :: dx, dy, dz, x_, y_, z_
+    integer :: kloc, kglob, nloc
+    
+    filemode = .not.(trim(filename) == 'null')
+
+    ! Convert runid to character
+    write(rc, '(I2.2)') runid
+    ax = to_lower(axis(1:1))
+    
+    ! Shapes and local indices
+    call reader%local_shape(nxloc, nyloc, nzloc)
+    call reader%global_shape(nx, ny, nz)
+    call reader%indices(xs, xe, ys, ye, zs, ze)
+    
+    ! Allocate local 3D field
+    allocate(f(nxloc, nyloc, nzloc))
+    allocate(mask(nxloc, nyloc, nzloc))
+
+    ! Get file list and sort by time
+    if(.not. filemode)then
+      call get_keys_stamps(trim(path), trim(rc), budget_source, trim(field), f_, sorted_keys, sorted_stamps)
+      num_stamps = size(sorted_keys)
+    else
+      num_stamps = 1
+    end if
+
+    select case(ax)
+    case('x')
+      xi = linspace(0.0_rk, Lx, nx)
+      ni=nx
+      nloc = nxloc
+      kstart = xs; kend=xe
+    case('y')
+      xi = linspace(0.0_rk, Ly, ny)
+      ni=ny
+      nloc = nyloc
+      kstart = ys; kend=ye
+    case('z')
+      xi = linspace(dz/2.0_rk, Lz-dz/2.0_rk, nz)
+      ni=nz
+      nloc = nzloc
+      kstart = zs; kend=ze
+    case default
+      call MPI_ABORT(MPI_COMM_WORLD, 322, ierr)
+    end select
+    allocate(local_sum(ni))
+    allocate(global_sum(ni))
+
+    dx = Lx/real(nx,rk)
+    dy = Ly/real(ny,rk)
+    dz = Lz/real(nz,rk)
+
+    do k=1,nzloc
+      do j=1,nyloc
+        do i=1,nxloc
+            x_ = real( xs + i - 1, rk) * dx - dx
+            y_ = real( ys + j - 1, rk ) * dy - dy
+            z_ = real( zs + k - 1, rk ) * dz + dz/2.0_rk - dz
+
+            if(((x1 <= x_ ).and.(x_ <= x2)) .and. &
+               ((y1 <= y_ ).and.(y_ <= y2)) .and. &
+               ((z1 <= z_ ).and.(z_ <= z2)) )then
+              mask(i,j,k) = 1._rk
+            else
+              mask(i,j,k) = 0._rk
+            end if
+        end do
+      end do
+    end do
+
+    ! Loop over time snapshots
+    do istamp = 1, num_stamps
+
+      local_sum = 0.0_rk
+      global_sum = 0.0_rk
+
+      if(filemode)then
+        f = reader%read_field(trim(path)//'/'//trim(filename))
+      else
+        if(.not. within_range(start_idx, end_idx, trim(sorted_keys(istamp)))) cycle
+        f = eval_field(trim(field), reader, budget_source, trim(path), trim(rc), trim(rc), trim(sorted_keys(istamp)), trim(sorted_stamps(istamp)))
+      end if
+
+      f = f * mask
+      
+      do kloc = 1, nloc
+        kglob = kstart + kloc - 1
+
+        select case(ax)
+        case('x')
+          f_slice => f(kloc,:,:)
+        case('y')
+          f_slice => f(:,kloc,:)
+        case('z')
+          f_slice => f(:,:,kloc)
+        case default
+          f_slice => null()
+        end select
+
+        local_sum(kglob) = SUM(f_slice)
+      end do
+
+      call MPI_Allreduce(local_sum, global_sum, ni, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
+      
+      if(myrank == 0)then
+        if(filemode)then
+          outname = trim(outdir)//'/'//trim(filename)//'_'//ax//'_profile.csv'
+        else
+          outname = trim(outdir)//'/Run'//trim(rc)//'_t'//trim(sorted_keys(istamp))//'_'//trim(ax)//'_profile_'//trim(f_)//'.csv'
+        end if
+        call csvprofile(ni, trim(outname) ,xi, global_sum)
+      end if
+    end do
+  end subroutine
+
   subroutine compute_abl(reader, Lx, Ly, Lz, runid, baserunid, budget_source, abl_type, path, outdir, start_idx, end_idx)
     implicit none
     class(FieldReader2Decomp), intent(inout) :: reader
@@ -2941,8 +3078,9 @@ program MPIR3D_
   integer :: ierr
   character(len=256) :: path, outdir
   character(len=256) :: field
-  integer:: nx=1, ny=1, nz=1, runid=1, taskid=0, num_slice=1, abl_type=0
-  real(rk):: Lx=1.0_rk, Ly=1.0_rk, Lz=1.0_rk
+  integer :: nx=1, ny=1, nz=1, runid=1, taskid=0, num_slice=1, abl_type=0
+  real(rk) :: Lx=1.0_rk, Ly=1.0_rk, Lz=1.0_rk
+  real(rk) :: x1=-1._rk, x2=-1._rk, y1=-1._rk, y2=-1._rk, z1=-1._rk, z2=-1._rk
   integer :: nlen, ioUnit=28
   character(:), allocatable :: inputfile
   character(len=1) :: slice_axis = 'z'
@@ -2954,6 +3092,7 @@ program MPIR3D_
   namelist /SETUP/ nx, ny, nz, Lx, Ly, Lz, path, outdir, runid, taskid, field, &
                    slice_axis, num_slice, slice_coord, budget_source, filename, &
                    start_idx, end_idx, abl_type
+  namelist /BOX/ x1, x2, y1, y2, z1, z2
       
   ! Initiate MPI
   ! -------------------------------------------------------------------------!
@@ -2976,7 +3115,9 @@ program MPIR3D_
   ! Read input namelist
   open(unit=ioUnit, file=trim(inputfile), form='FORMATTED', iostat=ierr)
   read(unit=ioUnit, NML=SETUP)
+  read(unit=ioUnit, NML=BOX)
   close(ioUnit)
+
   if (taskid == 1)then
     if(allocated(slice_coord_))deallocate(slice_coord_)
     allocate(slice_coord_(num_slice))
@@ -3003,6 +3144,10 @@ program MPIR3D_
     call miscellaneous_driver(reader, runid, trim(field), trim(path), start_idx, end_idx)
   else if (taskid == 2)then
     call compute_abl(reader, Lx, Ly, Lz, runid, runid-1, budget_source, abl_type, trim(path), trim(outdir), start_idx, end_idx)
+  else if (taskid == 3)then
+    call one_d_profile(reader, Lx, Ly, Lz, runid, budget_source, trim(path), &
+         trim(outdir), trim(field), start_idx, end_idx, trim(filename), slice_axis, &
+         x1, x2, y1, y2, z1, z2)
   end if
   
   if(myrank == 0) call message('Wrapping up ...')
