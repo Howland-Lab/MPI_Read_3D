@@ -288,7 +288,7 @@ contains
     character(*), intent(in) :: path, outdir, field
     integer,          intent(in)  :: budget_source
     real(rk), intent(in) :: Lz    
-    real(rk), allocatable :: f1(:,:,:), z(:)
+    real(rk), allocatable :: f1(:,:,:), x(:), y(:), z(:)
     character(len=:), allocatable :: sorted_keys(:), sorted_stamps(:)
     character(len=2) :: rc
     character(len=256):: f_
@@ -314,7 +314,8 @@ contains
     write(rc, '(I2.2)') runid
 
     ! Vertical coordinate z
-    z = linspace(0.0_rk, Lz, nz)  
+    allocate(x(nx), y(ny), z(nz))
+    call create_grid(1._rk, 1._rk, Lz, nx, ny, nz, x, y, z)
 
     ! Get file list and sort by time
     call get_keys_stamps(trim(path), trim(rc), budget_source, trim(field), f_, sorted_keys, sorted_stamps)
@@ -357,15 +358,42 @@ contains
     end do
   end subroutine ha_driver
 
-  subroutine slice_driver(reader, Lx, Ly, Lz, runid, path, outdir, field, axis, nslice, slice_coord, budget_source, start_idx, end_idx, filename)
+  function strip_extension(filename) result(basename)
+    implicit none
+    character(len=*), intent(in) :: filename
+    character(len=:), allocatable :: basename
+    integer :: i, last_dot, n
+
+    n = len_trim(filename)
+    last_dot = 0
+
+    ! Find last dot
+    do i = n, 1, -1
+      if (filename(i:i) == '.') then
+        last_dot = i
+        exit
+      end if
+    end do
+
+    ! Case 1: no dot found OR dot is first character (hidden file)
+    if (last_dot == 0 .or. last_dot == 1) then
+      basename = filename(1:n)
+    else
+      basename = filename(1:last_dot-1)
+    end if
+  end function strip_extension
+
+  subroutine slice_driver(reader, Lx, Ly, Lz, runid, path, outdir, field, axis, nslice, slice_coord,&
+       budget_source, start_idx, end_idx, filename, integrate)
     class(FieldReader2Decomp), intent(inout) :: reader
     integer,          intent(in)  :: runid, nslice
     integer,          intent(in)  :: start_idx, end_idx
-    character(*),     intent(in), optional  :: filename
+    character(*),     intent(in)  :: filename
     character(*),     intent(in)  :: path, outdir, field
     real(rk),         intent(in)  :: Lx, Ly, Lz, slice_coord(nslice)
     integer,          intent(in)  :: budget_source
     character(*),     intent(in)  :: axis   ! e.g. 'z'
+    logical,          intent(in)  :: integrate
 
     ! Local 3D field
     real(rk), allocatable, target :: f1(:,:,:)
@@ -393,14 +421,19 @@ contains
     ! Slice arrays (global shape on every rank)
     real(rk), allocatable :: local_slice0(:,:), local_slice1(:,:)
     real(rk), allocatable :: global_slice0(:,:), global_slice1(:,:), slice_interp(:,:)
-    real(rk), allocatable :: x1(:), x2(:)
+    real(rk), pointer :: x1(:), x2(:)
+    real(rk), allocatable, target :: x(:), y(:), z(:)
     real(rk), pointer :: slice_ptr(:,:)
+    real(rk) :: delta
 
-    integer :: i, j, isl, ierr, nx1, nx2, nax
+    integer :: i, j, isl, ierr, nx1, nx2, nax, jloc
     integer :: x1s, x1e, x2s, x2e, axs, axe
     real(rk) :: L1, L2, Lax, slice_
-    character(len=256) :: filename_
     logical :: filemode = .false.
+    character(len=2) :: term
+    character(len=1) :: budget
+    logical :: calc=.false.
+    
 
     ! Handling reference to wind speed and wind direction
     if(trim(field) == 'S')then
@@ -408,12 +441,14 @@ contains
       call MPI_Abort(MPI_COMM_WORLD, 100, ierr)
     end if
 
-    if(present(filename)) then
-      filename_ = trim(filename)
-    else
-      filename_ = 'null'
+    filemode = .not.(trim(filename) == 'null')
+    if(myrank == 0) then
+      if(filemode)then
+        call message('file mode is true')
+      else
+        call message('file mode is false')
+      end if
     end if
-    filemode = .not.(trim(filename_) == 'null')
 
     ! Convert runid to character
     write(rc, '(I2.2)') runid
@@ -435,6 +470,10 @@ contains
       num_stamps = 1
     end if
 
+    ! Mesh
+    allocate(x(nx), y(ny), z(nz))
+    call create_grid(Lx, Ly, Lz, nx, ny, nz, x, y, z)
+    
     ! Figure which coordinate names to use
     select case (ax)
     case ('x')
@@ -444,6 +483,8 @@ contains
       x1s = ys; x1e = ye; x2s = zs; x2e = ze
       axs = xs; axe = xe
       eax = 'i'
+      x1 => y
+      x2 => z
     case ('y')
       x1name = 'x'; x2name = 'z'
       nx1 = nx; nx2 = nz; nax = ny
@@ -451,6 +492,8 @@ contains
       x1s = xs; x1e = xe; x2s = zs; x2e = ze
       axs = ys; axe = ye
       eax = 'j'
+      x1 => x
+      x2 => z
     case ('z')
       x1name = 'x'; x2name = 'y' 
       nx1 = nx; nx2 = ny; nax = nz
@@ -458,116 +501,168 @@ contains
       x1s = xs; x1e = xe; x2s = ys; x2e = ye
       axs = zs; axe = ze
       eax = 'k'
+      x1 => x
+      x2 => y
     end select
-    
-    x1 = linspace(0.0_rk, L1, nx1)
-    x2 = linspace(0.0_rk, L2, nx2)
-    
+    delta = Lax/real(nax,rk)
+
     ! Global slice arrays (same shape on all ranks)
-    allocate(local_slice0(nx1, nx2), local_slice1(nx1, nx2))
-    allocate(global_slice0(nx1, nx2), global_slice1(nx1, nx2))
-    allocate(slice_interp(nx1, nx2))
+    allocate(local_slice0(nx1, nx2))
+    allocate(global_slice0(nx1, nx2))
+    if(.not. integrate)then
+      allocate(local_slice1(nx1, nx2))
+      allocate(global_slice1(nx1, nx2))
+      allocate(slice_interp(nx1, nx2))
+    end if
 
-    do isl = 1, nslice
-      slice_ = slice_coord(isl)
-      if (myrank == 0) then
-        write(msg,'(A, I0, A, I0, A, ES12.4)') 'Slice ',isl,'/',nslice,', '//ax//' = ',slice_
-        call message(trim(msg))
+    ! Loop over files first to avoid redundant multiple reads of the same file
+    timeloop: do k = 1, num_stamps
+
+      ! Either read a field or directly from a filename
+      if(filemode)then
+        f1 = reader%read_field(trim(path)//'/'//trim(filename))
+      else
+        if(.not. within_range(start_idx, end_idx, trim(sorted_keys(k)))) cycle
+        f1 = eval_field(trim(field), reader, budget_source, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
       end if
 
-      ! Wipe clean slice arrays
-      local_slice0 = 0.0_rk; local_slice1 = 0.0_rk
-      global_slice0 = 0.0_rk; global_slice1 = 0.0_rk
-      slice_interp = 0.0_rk
-
-      ! Compute bracketing indices for z
-      call find_bracket_uniform(nax, Lax, slice_, k0, k1, alpha)
-      if (myrank == 0) then
-        write(msg,'(A, I0, A, I0, A, ES12.4)')'k0 = ',k0,', k1 = ',k1,', alpha = ',alpha
-        call message(trim(msg))
-      end if
-
-      ! Loop over time snapshots
-      do k = 1, num_stamps
-
-        if(filemode)then
-          f1 = reader%read_field(trim(path)//'/'//trim(filename_))
-        else
-          if(.not. within_range(start_idx, end_idx, trim(sorted_keys(k)))) cycle
-          f1 = eval_field(trim(field), reader, budget_source, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-        end if
-        
-        ! 2) Build local contributions to the two bracketing planes
+      mode: if(integrate)then
+        ! Wipe clean slice arrays
         local_slice0 = 0.0_rk
-        local_slice1 = 0.0_rk
+        global_slice0 = 0.0_rk
 
-        block
-          logical :: has0, has1
-          integer :: k0_loc, k1_loc
-
-          has0 = (k0 >= axs .and. k0 <= axe)
-          has1 = (k1 >= axs .and. k1 <= axe)
-
-          if (has0) then
-            k0_loc = k0 - axs + 1
-            select case(ax)
-            case('x')
-              slice_ptr => f1(k0_loc,:,:)
-            case('y')
-              slice_ptr => f1(:,k0_loc,:)
-            case('z')
-              slice_ptr => f1(:,:,k0_loc)
-            end select
-            local_slice0(x1s:x1e, x2s:x2e) = slice_ptr(:,:)
-          end if
-
-          if (has1) then
-            k1_loc = k1 - axs + 1
-            select case(ax)
-            case('x')
-              slice_ptr => f1(k1_loc,:,:)
-            case('y')
-              slice_ptr => f1(:,k1_loc,:)
-            case('z')
-              slice_ptr => f1(:,:,k1_loc)
-            end select
-            local_slice1(x1s:x1e, x2s:x2e) = slice_ptr(:,:)
-          end if
-        end block
+        ! Loop over the axis we integrate along
+        ! j is global index
+        do j=axs, axe
+          jloc = j - axs + 1
+          select case(ax)
+          case('x')
+            slice_ptr => f1(jloc,:,:)
+          case('y')
+            slice_ptr => f1(:,jloc,:)
+          case('z')
+            slice_ptr => f1(:,:,jloc)
+          end select
+          local_slice0(x1s:x1e, x2s:x2e) = local_slice0(x1s:x1e, x2s:x2e) + slice_ptr(:,:)*delta
+        end do
 
         ! 3) Sum contributions from all ranks to get full global slices
         call MPI_Allreduce(local_slice0, global_slice0, nx1*nx2, MPI_DOUBLE_PRECISION, &
                           MPI_SUM, MPI_COMM_WORLD, ierr)
-        call MPI_Allreduce(local_slice1, global_slice1, nx1*nx2, MPI_DOUBLE_PRECISION, &
-                          MPI_SUM, MPI_COMM_WORLD, ierr)
 
-        ! 4) On root: do linear interpolation and write CSV
         if (myrank == 0) then
-          do j = 1, nx2
-            do i = 1, nx1
-              slice_interp(i,j) = (1.0_rk - alpha) * global_slice0(i,j) + alpha * global_slice1(i,j)
-            end do
-          end do
-
           ! Output file name
           if(.not. filemode) then
-            fname = trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//&
-                    '_SL_'//trim(f_)//'_'//ax
+            call define_budget(trim(field), budget, term, budget_source, calc)
+            call create_file_name(budget_source, rc, trim(field), budget, term, trim(sorted_keys(k)), trim(sorted_stamps(k)), fname)
+            fname = trim(outdir)//'/'//trim(strip_extension(trim(fname)))
           else
-            fname = trim(outdir)//'/'//trim(filename_)//'_SL_'//ax            
+            fname = trim(outdir)//'/'//trim(strip_extension(trim(filename)))    
           end if
-          if(slice_ <= -1) fname = trim(fname)//'_'//eax ! A direct index is given
-          fname = trim(fname)//'='//trim(real2string(slice_))        
+          fname = trim(fname)//'_integ_'//trim(ax)//'.nc'
           
-          !call writeslice(nx1, nx2, trim(fname)//'.csv', slice_interp)
-          call export_slice_to_netcdf(trim(fname)//'.nc', trim(field), slice_interp, x1, x2, x1name, x2name)
+          call message("Exporting to: "//trim(fname))
+          call export_slice_to_netcdf(trim(fname), trim(field), global_slice0, x1, x2, x1name, x2name)
         end if
+      
+      else
 
+        sliceloop: do isl = 1, nslice
+          slice_ = slice_coord(isl)
+          if (myrank == 0) then
+            write(msg,'(A, I0, A, I0, A, ES12.4)') 'Slice ',isl,'/',nslice,', '//ax//' = ',slice_
+            call message(trim(msg))
+          end if
+
+          ! Wipe clean slice arrays
+          local_slice0 = 0.0_rk; local_slice1 = 0.0_rk
+          global_slice0 = 0.0_rk; global_slice1 = 0.0_rk
+          slice_interp = 0.0_rk
+
+          ! Compute bracketing indices for z
+          call find_bracket_uniform(nax, Lax, slice_, k0, k1, alpha)
+          if (myrank == 0) then
+            write(msg,'(A, I0, A, I0, A, ES12.4)')'k0 = ',k0,', k1 = ',k1,', alpha = ',alpha
+            call message(trim(msg))
+          end if
+
+          ! 2) Build local contributions to the two bracketing planes
+          local_slice0 = 0.0_rk
+          local_slice1 = 0.0_rk
+
+          block
+            logical :: has0, has1
+            integer :: k0_loc, k1_loc
+
+            has0 = (k0 >= axs .and. k0 <= axe)
+            has1 = (k1 >= axs .and. k1 <= axe)
+
+            if (has0) then
+              k0_loc = k0 - axs + 1
+              select case(ax)
+              case('x')
+                slice_ptr => f1(k0_loc,:,:)
+              case('y')
+                slice_ptr => f1(:,k0_loc,:)
+              case('z')
+                slice_ptr => f1(:,:,k0_loc)
+              end select
+              local_slice0(x1s:x1e, x2s:x2e) = slice_ptr(:,:)
+            end if
+
+            if (has1) then
+              k1_loc = k1 - axs + 1
+              select case(ax)
+              case('x')
+                slice_ptr => f1(k1_loc,:,:)
+              case('y')
+                slice_ptr => f1(:,k1_loc,:)
+              case('z')
+                slice_ptr => f1(:,:,k1_loc)
+              end select
+              local_slice1(x1s:x1e, x2s:x2e) = slice_ptr(:,:)
+            end if
+          end block
+
+          ! 3) Sum contributions from all ranks to get full global slices
+          call MPI_Allreduce(local_slice0, global_slice0, nx1*nx2, MPI_DOUBLE_PRECISION, &
+                            MPI_SUM, MPI_COMM_WORLD, ierr)
+          call MPI_Allreduce(local_slice1, global_slice1, nx1*nx2, MPI_DOUBLE_PRECISION, &
+                            MPI_SUM, MPI_COMM_WORLD, ierr)
+
+          ! 4) On root: do linear interpolation and write CSV
+          if (myrank == 0) then
+            do j = 1, nx2
+              do i = 1, nx1
+                slice_interp(i,j) = (1.0_rk - alpha) * global_slice0(i,j) + alpha * global_slice1(i,j)
+              end do
+            end do
+
+            ! Output file name
+            if(.not. filemode) then
+              call define_budget(trim(field), budget, term, budget_source, calc)
+              call create_file_name(budget_source, rc, trim(field), budget, term, trim(sorted_keys(k)), trim(sorted_stamps(k)), fname)
+              fname = trim(outdir)//'/'//trim(strip_extension(trim(fname)))//&
+                      '_SL_'//trim(f_)//'_'//ax
+            else
+              fname = trim(outdir)//'/'//trim(strip_extension(filename))//'_SL_'//ax            
+            end if
+            if(slice_ <= -1) fname = trim(fname)//'_'//eax ! A direct index is given
+            fname = trim(fname)//'='//trim(real2string(slice_))//'.nc'      
+            
+            call message("Exporting to: "//trim(fname))
+            call export_slice_to_netcdf(trim(fname), trim(field), slice_interp, x1, x2, x1name, x2name)
+
+          end if
+        end do sliceloop
+        
         call MPI_Barrier(MPI_COMM_WORLD, ierr)
-
         if(myrank == 0) call message(' ')
-      end do  ! time loop
-    end do
+      end if mode
+
+      call MPI_Barrier(MPI_COMM_WORLD, ierr)
+      if(myrank == 0) call message(' ')
+    end do timeloop
 
     ! Cleanup
     if (allocated(f1))           deallocate(f1)
@@ -594,8 +689,10 @@ contains
     integer :: xs, xe, ys, ye, zs, ze  
     character(len=:), allocatable :: sorted_keys(:), sorted_stamps(:)
     real(rk), allocatable, target :: f(:,:,:)
-    real(rk), allocatable :: mask(:,:,:), xi(:), local_sum(:), global_sum(:)
+    real(rk), allocatable :: mask(:,:,:), local_sum(:), global_sum(:)
     real(rk), dimension(:,:), pointer :: f_slice
+    real(rk), allocatable, target :: x(:), y(:), z(:)
+    real(rk), pointer :: xi(:)
     character(len=512) :: f_
     logical :: filemode = .false.
     integer :: num_stamps, ni, i, j, k, kstart, kend, ierr, istamp
@@ -626,19 +723,22 @@ contains
       num_stamps = 1
     end if
 
+    allocate(x(nx), y(ny), z(nz))
+    call create_grid(Lx, Ly, Lz, nx, ny, nz, x, y, z)
+
     select case(ax)
     case('x')
-      xi = linspace(0.0_rk, Lx, nx)
+      xi => x
       ni=nx
       nloc = nxloc
       kstart = xs; kend=xe
     case('y')
-      xi = linspace(0.0_rk, Ly, ny)
+      xi => y
       ni=ny
       nloc = nyloc
       kstart = ys; kend=ye
     case('z')
-      xi = linspace(dz/2.0_rk, Lz-dz/2.0_rk, nz)
+      xi => z
       ni=nz
       nloc = nzloc
       kstart = zs; kend=ze
@@ -706,12 +806,35 @@ contains
       
       if(myrank == 0)then
         if(filemode)then
-          outname = trim(outdir)//'/'//trim(filename)//'_'//ax//'_profile.csv'
+          outname = trim(outdir)//'/'//trim(strip_extension(filename))//'_'//ax//'_profile.csv'
         else
           outname = trim(outdir)//'/Run'//trim(rc)//'_t'//trim(sorted_keys(istamp))//'_'//trim(ax)//'_profile_'//trim(f_)//'.csv'
         end if
         call csvprofile(ni, trim(outname) ,xi, global_sum)
       end if
+    end do
+  end subroutine
+
+  subroutine create_grid(Lx, Ly, Lz, nx, ny, nz, xaxis, yaxis, zaxis)
+    implicit none
+    real(rk), intent(in) :: Lx, Ly, Lz
+    integer, intent(in) :: nx, ny, nz
+    real(rk), dimension(*), intent(out) :: xaxis, yaxis, zaxis
+    real(rk) :: dx, dy, dz
+    integer :: i
+    
+    dx = Lx/real(nx,rk)
+    dy = Ly/real(ny,rk)
+    dz = Lz/real(nz,rk)
+
+    do i=1,nx
+      xaxis(i) = real(i-1, rk) * dx
+    end do
+    do i=1,ny
+      yaxis(i) = real(i-1, rk) * dy
+    end do
+    do i=1,nz
+      zaxis(i) = real(i - 0.5, rk) * dz
     end do
   end subroutine
 
@@ -728,7 +851,6 @@ contains
     integer :: xs, xe, ys, ye, zs, ze  
     real(rk), allocatable :: uw(:,:,:), vw(:,:,:), buffer(:,:,:), zcross(:,:), zcross_global(:,:)
     real(rk), allocatable :: x(:), y(:), z(:)
-    real(rk) :: dz
     character(len=256) :: f_, fname, Lxc, Lyc, Lzc
     character(len=:), allocatable :: sorted_keys(:), sorted_stamps(:)
     character(1) :: method
@@ -747,12 +869,10 @@ contains
     allocate(buffer(nxloc, nyloc, nzloc))
     allocate(zcross(nx, ny))
     allocate(zcross_global(nx, ny))
-    
-    x = linspace(0.0_rk, Lx, nx) 
-    y = linspace(0.0_rk, Ly, ny) 
-    dz = Lz/nz
-    z = linspace(dz/2.0_rk, Lz-dz/2.0_rk, nz)
 
+    allocate(x(nx), y(ny), z(nz))
+    call create_grid(Lx, Ly, Lz, nx, ny, nz, x, y, z)
+    
     if (myrank == 0) then
       write(Lxc, '(F10.3)') Lx
       call message('Domain length is '//trim(Lxc))
@@ -3089,9 +3209,10 @@ program MPIR3D_
   integer :: budget_source, nxloc, nyloc, nzloc
   character(len=256) :: filename = 'null'
   integer :: start_idx=0, end_idx=huge(1)
+  logical :: integrate = .false.
   namelist /SETUP/ nx, ny, nz, Lx, Ly, Lz, path, outdir, runid, taskid, field, &
                    slice_axis, num_slice, slice_coord, budget_source, filename, &
-                   start_idx, end_idx, abl_type
+                   start_idx, end_idx, abl_type, integrate
   namelist /BOX/ x1, x2, y1, y2, z1, z2
       
   ! Initiate MPI
@@ -3138,7 +3259,7 @@ program MPIR3D_
   else if (taskid == 1) then
     ! Slice
     call slice_driver(reader, Lx, Ly, Lz, runid, trim(path), trim(outdir), trim(field), &
-      slice_axis, num_slice, slice_coord_, budget_source, start_idx, end_idx, filename=trim(filename))
+      slice_axis, num_slice, slice_coord_, budget_source, start_idx, end_idx, trim(filename), integrate)
   else if (taskid == -1) then
     ! Miscellaneous tasks
     call miscellaneous_driver(reader, runid, trim(field), trim(path), start_idx, end_idx)
