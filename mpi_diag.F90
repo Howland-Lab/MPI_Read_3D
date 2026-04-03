@@ -383,6 +383,83 @@ contains
     end if
   end function strip_extension
 
+  subroutine max_time_change(reader, Lx, Ly, Lz, runid, path, outdir, field, budget_source, start_idx, end_idx, filename)
+    implicit none
+    class(FieldReader2Decomp), intent(inout) :: reader
+    integer,          intent(in)  :: runid
+    integer,          intent(in)  :: start_idx, end_idx
+    character(*),     intent(in)  :: filename
+    character(*),     intent(in)  :: path, outdir, field
+    integer,          intent(in)  :: budget_source
+    real(rk),         intent(in)  :: Lx, Ly, Lz
+
+    real(rk), allocatable :: f1(:,:,:), f2(:,:,:)
+
+    integer :: nx, ny, nz
+    integer :: nxloc, nyloc, nzloc
+    integer :: xs, xe, ys, ye, zs, ze
+    integer :: num_stamps
+    integer :: k, ierr
+
+    character(len=:), allocatable :: sorted_keys(:), sorted_stamps(:)
+    character(len=256) :: f_, msg
+    character(len=16)  :: rc
+
+    logical :: first
+
+    first = .true.
+
+    write(rc, '(I2.2)') runid
+
+    call reader%local_shape(nxloc, nyloc, nzloc)
+    call reader%global_shape(nx, ny, nz)
+    call reader%indices(xs, xe, ys, ye, zs, ze)
+
+    allocate(f1(nxloc, nyloc, nzloc))
+    allocate(f2(nxloc, nyloc, nzloc))
+
+    call get_keys_stamps(trim(path), trim(rc), budget_source, trim(field), f_, sorted_keys, sorted_stamps)
+    num_stamps = size(sorted_keys)
+
+    timeloop: do k = 1, num_stamps
+      if (.not. within_range(start_idx, end_idx, trim(sorted_keys(k)))) cycle
+
+      if (.not. first) f2 = f1
+
+      f1 = eval_field(trim(field), reader, budget_source, trim(path), trim(rc), trim(rc), &
+                      trim(sorted_keys(k)), trim(sorted_stamps(k)))
+
+      if (first) then
+        first = .false.
+        cycle
+      end if
+
+      block
+        real(rk) :: local_max, global_max
+        integer  :: i, j, m
+
+        local_max = 0.0_rk
+        do m = 1, nzloc
+          do j = 1, nyloc
+            do i = 1, nxloc
+              local_max = max(local_max, abs(f1(i,j,m) - f2(i,j,m)))
+            end do
+          end do
+        end do
+
+        call MPI_Allreduce(local_max, global_max, 1, MPI_DOUBLE_PRECISION, MPI_MAX, MPI_COMM_WORLD, ierr)
+
+        if (myrank == 0) then
+          write(msg,'("Time: ",A," Max change: ",E12.5)') trim(sorted_stamps(k)), global_max
+          call message(trim(msg))
+        end if
+      end block
+    end do timeloop
+
+    if (allocated(f1)) deallocate(f1)
+    if (allocated(f2)) deallocate(f2)
+  end subroutine max_time_change
+
   subroutine slice_driver(reader, Lx, Ly, Lz, runid, path, outdir, field, axis, nslice, slice_coord,&
        budget_source, start_idx, end_idx, filename, integrate)
     class(FieldReader2Decomp), intent(inout) :: reader
@@ -3270,6 +3347,9 @@ program MPIR3D_
     call one_d_profile(reader, Lx, Ly, Lz, runid, budget_source, trim(path), &
          trim(outdir), trim(field), start_idx, end_idx, trim(filename), slice_axis, &
          x1, x2, y1, y2, z1, z2)
+  else if (taskid == 4)then
+    call max_time_change(reader, Lx, Ly, Lz, runid, trim(path), trim(outdir), trim(field), &
+      budget_source, start_idx, end_idx, trim(filename))
   end if
   
   if(myrank == 0) call message('Wrapping up ...')
