@@ -2714,7 +2714,8 @@ contains
     p_esc = escape_single_quotes(trim(pattern))
     tmpfile = '/tmp/fortran_glob_'//to_string(getpid())//'_keys.txt'
 
-    cmd = "find '"//d_esc//"' -maxdepth 1 -type f -name '"//p_esc//"' -printf '%f\n' > '"//tmpfile//"' 2>/dev/null"
+    ! cmd = "find '"//d_esc//"' -maxdepth 1 -type f -name '"//p_esc//"' -printf '%f\n' > '"//tmpfile//"' 2>/dev/null"
+    cmd = "find -L '"//d_esc//"' -maxdepth 1 -type f -name '"//p_esc//"' -printf '%f\n' > '"//tmpfile//"' 2>/dev/null"
     call execute_command_line(cmd, exitstat=istat)
     if (istat /= 0) return
 
