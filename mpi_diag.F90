@@ -383,15 +383,13 @@ contains
     end if
   end function strip_extension
 
-  subroutine max_time_change(reader, Lx, Ly, Lz, runid, path, outdir, field, budget_source, start_idx, end_idx, filename)
+  subroutine max_time_change(reader, runid, path, field, budget_source, start_idx, end_idx)
     implicit none
     class(FieldReader2Decomp), intent(inout) :: reader
     integer,          intent(in)  :: runid
     integer,          intent(in)  :: start_idx, end_idx
-    character(*),     intent(in)  :: filename
-    character(*),     intent(in)  :: path, outdir, field
+    character(*),     intent(in)  :: path, field
     integer,          intent(in)  :: budget_source
-    real(rk),         intent(in)  :: Lx, Ly, Lz
 
     real(rk), allocatable :: f1(:,:,:), f2(:,:,:)
 
@@ -402,7 +400,7 @@ contains
     integer :: k, ierr
 
     character(len=:), allocatable :: sorted_keys(:), sorted_stamps(:)
-    character(len=256) :: f_, msg
+    character(len=256) :: f_
     character(len=16)  :: rc
 
     logical :: first
@@ -450,8 +448,7 @@ contains
         call MPI_Allreduce(local_max, global_max, 1, MPI_DOUBLE_PRECISION, MPI_MAX, MPI_COMM_WORLD, ierr)
 
         if (myrank == 0) then
-          write(msg,'("Time: ",A," Max change: ",E12.5)') trim(sorted_stamps(k)), global_max
-          call message(trim(msg))
+            write(*,'("Time: ",A," Max change: ",ES12.5)') trim(sorted_stamps(k)), global_max
         end if
       end block
     end do timeloop
@@ -3348,8 +3345,8 @@ program MPIR3D_
          trim(outdir), trim(field), start_idx, end_idx, trim(filename), slice_axis, &
          x1, x2, y1, y2, z1, z2)
   else if (taskid == 4)then
-    call max_time_change(reader, Lx, Ly, Lz, runid, trim(path), trim(outdir), trim(field), &
-      budget_source, start_idx, end_idx, trim(filename))
+    call max_time_change(reader, runid, trim(path), trim(field), &
+      budget_source, start_idx, end_idx)
   end if
   
   if(myrank == 0) call message('Wrapping up ...')
