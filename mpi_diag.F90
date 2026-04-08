@@ -1537,7 +1537,11 @@ contains
 
     if (budget_source == instfieldsrc)then
       f_ = field_to_name(trim(field))
-      call list_matching_keys(trim(path), 'Run'//trim(rc)//'_'//trim(f_)//'_t*.out', keys)
+      pattern = 'Run'//trim(rc)//'_'//trim(f_)//'_t*.out'
+
+      if (myrank == 0)call message('Pattern is '//trim(pattern))
+
+      call list_matching_keys(trim(path), trim(pattern), keys)
       sorted_keys = sort_keys_numeric(keys)
     else
       f_ = trim(field)
@@ -2788,8 +2792,8 @@ contains
     p_esc = escape_single_quotes(trim(pattern))
     tmpfile = '/tmp/fortran_glob_'//to_string(getpid())//'_keys.txt'
 
-    ! cmd = "find '"//d_esc//"' -maxdepth 1 -type f -name '"//p_esc//"' -printf '%f\n' > '"//tmpfile//"' 2>/dev/null"
-    cmd = "find -L '"//d_esc//"' -maxdepth 1 -type f -name '"//p_esc//"' -printf '%f\n' > '"//tmpfile//"' 2>/dev/null"
+    cmd = "find '"//d_esc//"' -maxdepth 1 -type f -name '"//p_esc//"' -printf '%f\n' > '"//tmpfile//"' 2>/dev/null"
+    ! cmd = "find '"//d_esc//"' -maxdepth 1 \( -type f -o -type l \) -name '"//p_esc//"' -printf '%f\n' > '"//tmpfile//"' 2>/dev/null"
     call execute_command_line(cmd, exitstat=istat)
     if (istat /= 0) return
 
