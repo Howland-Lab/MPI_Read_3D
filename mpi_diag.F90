@@ -50,7 +50,172 @@ module MPIR3D
      final       :: frd_finalize
   end type FieldReader2Decomp
 
+  type :: slice_packet_t
+     integer :: nslices = 0
+     character(len=1) :: axis = ' '
+     real(rk), allocatable :: coords(:)
+     integer :: integrate = 0
+  end type slice_packet_t
+
 contains
+
+  subroutine read_slice_map(filename, packets, ierr)
+    implicit none
+
+    character(len=*), intent(in) :: filename
+    type(slice_packet_t), allocatable, intent(out) :: packets(:)
+    integer, intent(out), optional :: ierr
+
+    integer :: unit
+    integer :: ios
+    integer :: npackets
+    integer :: ip
+    character(len=2048) :: line
+
+    if (present(ierr)) ierr = 0
+
+    open(newunit=unit, file=filename, status='old', action='read', iostat=ios)
+    if (ios /= 0) then
+       if (present(ierr)) then
+          ierr = ios
+          return
+       else
+          error stop "Could not open slice-map file."
+       end if
+    end if
+
+    ! First line: number of slice packets
+    call read_nonempty_line(unit, line, ios)
+    if (ios /= 0) call fail(unit, ios, ierr, "Could not read number of packets.")
+
+    read(line, *, iostat=ios) npackets
+    if (ios /= 0) call fail(unit, ios, ierr, "Invalid number of packets.")
+
+    allocate(packets(npackets))
+
+    do ip = 1, npackets
+
+       ! First line in packet: number of slices
+       call read_nonempty_line(unit, line, ios)
+       if (ios /= 0) call fail(unit, ios, ierr, "Could not read number of slices.")
+
+       read(line, *, iostat=ios) packets(ip)%nslices
+       if (ios /= 0) call fail(unit, ios, ierr, "Invalid number of slices.")
+
+       allocate(packets(ip)%coords(packets(ip)%nslices))
+
+       ! Second line in packet: axis, e.g. "x", "y", "z"
+       call read_nonempty_line(unit, line, ios)
+       if (ios /= 0) call fail(unit, ios, ierr, "Could not read slice axis.")
+
+       packets(ip)%axis = parse_axis(line)
+
+       if (.not. any(packets(ip)%axis == ['x', 'y', 'z'])) then
+          call fail(unit, -1, ierr, "Invalid slice axis.")
+       end if
+
+       ! Third line in packet: coordinate list
+       call read_nonempty_line(unit, line, ios)
+       if (ios /= 0) call fail(unit, ios, ierr, "Could not read coordinate list.")
+
+       call parse_real_list(line, packets(ip)%coords, ios)
+       if (ios /= 0) call fail(unit, ios, ierr, "Invalid coordinate list.")
+
+       ! Fourth line in packet: integration flag
+       call read_nonempty_line(unit, line, ios)
+       if (ios /= 0) call fail(unit, ios, ierr, "Could not read integration flag.")
+
+       read(line, *, iostat=ios) packets(ip)%integrate
+       if (ios /= 0) call fail(unit, ios, ierr, "Invalid integration flag.")
+
+       if (.not. any(packets(ip)%integrate == [0, 1])) then
+          call fail(unit, -2, ierr, "Integration flag must be 0 or 1.")
+       end if
+
+    end do
+
+    close(unit)
+
+  end subroutine read_slice_map
+
+  subroutine read_nonempty_line(unit, line, ios)
+    implicit none
+
+    integer, intent(in) :: unit
+    character(len=*), intent(out) :: line
+    integer, intent(out) :: ios
+
+    do
+       read(unit, '(A)', iostat=ios) line
+       if (ios /= 0) return
+       if (len_trim(line) > 0) return
+    end do
+
+  end subroutine read_nonempty_line
+
+  function parse_axis(line) result(axis)
+    implicit none
+
+    character(len=*), intent(in) :: line
+    character(len=1) :: axis
+    character(len=:), allocatable :: tmp
+    integer :: i
+
+    tmp = adjustl(trim(line))
+
+    ! Remove quotes if present.
+    do i = 1, len_trim(tmp)
+       if (tmp(i:i) /= '"' .and. tmp(i:i) /= "'") then
+          axis = tmp(i:i)
+          return
+       end if
+    end do
+
+    axis = ' '
+
+  end function parse_axis
+
+  subroutine parse_real_list(line, values, ios)
+    implicit none
+
+    character(len=*), intent(in) :: line
+    real(rk), intent(out) :: values(:)
+    integer, intent(out) :: ios
+
+    character(len=:), allocatable :: tmp
+    integer :: i
+
+    tmp = trim(line)
+
+    ! Convert comma-separated list to whitespace-separated list.
+    do i = 1, len(tmp)
+       if (tmp(i:i) == ',') tmp(i:i) = ' '
+    end do
+
+    read(tmp, *, iostat=ios) values
+
+  end subroutine parse_real_list
+
+
+  subroutine fail(unit, code, ierr, message)
+    implicit none
+
+    integer, intent(in) :: unit
+    integer, intent(in) :: code
+    integer, intent(out), optional :: ierr
+    character(len=*), intent(in) :: message
+
+    close(unit)
+
+    if (present(ierr)) then
+       ierr = code
+       return
+    else
+       print *, trim(message)
+       error stop
+    end if
+
+  end subroutine fail
 
   logical function within_range(istart, iend, tidx)
       implicit none
@@ -457,17 +622,90 @@ contains
     if (allocated(f2)) deallocate(f2)
   end subroutine max_time_change
 
-  subroutine slice_driver(reader, Lx, Ly, Lz, runid, path, outdir, field, axis, nslice, slice_coord,&
-       budget_source, start_idx, end_idx, filename, integrate)
+  subroutine read_field_list(filename, field_list, ierr)
+    implicit none
+
+    character(len=*), intent(in) :: filename
+    character(len=100), allocatable, intent(out) :: field_list(:)
+    integer, intent(out), optional :: ierr
+
+    integer :: unit
+    integer :: ios
+    integer :: nfields
+    integer :: i
+    character(len=2048) :: line
+
+    if (present(ierr)) ierr = 0
+
+    open(newunit=unit, file=filename, status='old', action='read', iostat=ios)
+    if (ios /= 0) then
+      if (present(ierr)) then
+          ierr = ios
+          return
+      else
+          error stop "Could not open field-list file."
+      end if
+    end if
+
+    ! First pass: count nonempty lines.
+    nfields = 0
+
+    do
+      call read_nonempty_line(unit, line, ios)
+      if (ios /= 0) exit
+
+      nfields = nfields + 1
+    end do
+
+    if (ios > 0) then
+      close(unit)
+      if (present(ierr)) then
+          ierr = ios
+          return
+      else
+          error stop "Error while reading field-list file."
+      end if
+    end if
+
+    allocate(field_list(nfields))
+
+    ! Second pass: read field names.
+    rewind(unit)
+
+    i = 0
+
+    do
+      call read_nonempty_line(unit, line, ios)
+      if (ios /= 0) exit
+
+      i = i + 1
+      field_list(i) = adjustl(trim(line))
+    end do
+
+    close(unit)
+
+  end subroutine read_field_list
+
+  logical function has_s3d_extension(filename)
+    implicit none
+    character(len=*), intent(in) :: filename
+    integer :: n
+
+    n = len_trim(filename)
+
+    has_s3d_extension = .false.
+
+    if (n >= 4) then
+        has_s3d_extension = filename(n-3:n) == ".s3D"
+    end if
+  end function has_s3d_extension
+
+  subroutine slice_driver(reader, Lx, Ly, Lz, runid, path, outdir, fieldfile, slice_map, budget_source, start_idx, end_idx, filename)
     class(FieldReader2Decomp), intent(inout) :: reader
-    integer,          intent(in)  :: runid, nslice
-    integer,          intent(in)  :: start_idx, end_idx
-    character(*),     intent(in)  :: filename
-    character(*),     intent(in)  :: path, outdir, field
-    real(rk),         intent(in)  :: Lx, Ly, Lz, slice_coord(nslice)
+    integer,          intent(in)  :: runid, start_idx, end_idx
+    character(*),     intent(in)  :: path, outdir, fieldfile, slice_map, filename
+    real(rk),         intent(in)  :: Lx, Ly, Lz
     integer,          intent(in)  :: budget_source
-    character(*),     intent(in)  :: axis   ! e.g. 'z'
-    logical,          intent(in)  :: integrate
 
     ! Local 3D field
     real(rk), allocatable, target :: f1(:,:,:)
@@ -477,14 +715,11 @@ contains
     integer :: nxloc, nyloc, nzloc
     integer :: xs, xe, ys, ye, zs, ze
     
-    ! Global coordinates
-    ! real(rk), allocatable :: x1(:), x2(:)
-
     ! Slice indices and interpolation
     integer :: k, k0, k1
     real(rk) :: alpha
     character(len=2) :: rc
-    character(len=256) :: f_
+    character(len=256) :: f_, field
     character(len=1) :: ax, x1name, x2name, eax
     character(len=256) :: fname, msg
 
@@ -506,14 +741,11 @@ contains
     logical :: filemode = .false.
     character(len=2) :: term
     character(len=1) :: budget
-    logical :: calc=.false.
-    
-
-    ! Handling reference to wind speed and wind direction
-    if(trim(field) == 'S')then
-      if(myrank == 0) call message('ERROR(Slice): Export u and v separately and calculate WS & WD offline.')
-      call MPI_Abort(MPI_COMM_WORLD, 100, ierr)
-    end if
+    logical :: calc=.false., integrate
+    character(len=100), allocatable :: field_list(:)
+    integer :: nfields=0, ifield, islice
+    type(slice_packet_t), allocatable :: slice_packets(:)
+    integer :: nslice
 
     filemode = .not.(trim(filename) == 'null')
     if(myrank == 0) then
@@ -524,9 +756,27 @@ contains
       end if
     end if
 
+    ! Read list of fields to be processed if not in file mode
+    if(filemode)then
+      nfields = 1
+    else
+      call read_field_list(trim(fieldfile), field_list, ierr)
+      if (ierr /= 0) then
+        print *, "Error reading field list. ierr = ", ierr
+        call MPI_ABORT(MPI_COMM_WORLD, 1123, ierr)
+      end if
+      nfields=size(field_list)
+    end if
+
+    ! Read slice map to get axis and slice coordinates
+    call read_slice_map(trim(slice_map), slice_packets, ierr)
+    if (ierr /= 0) then
+      print *, "Error reading slice map. ierr = ", ierr
+      call MPI_ABORT(MPI_COMM_WORLD, 1124, ierr)
+    end if
+
     ! Convert runid to character
     write(rc, '(I2.2)') runid
-    ax = to_lower(axis(1:1))
 
     ! Shapes and local indices
     call reader%local_shape(nxloc, nyloc, nzloc)
@@ -538,7 +788,7 @@ contains
 
     ! Get file list and sort by time
     if(.not. filemode)then
-      call get_keys_stamps(trim(path), trim(rc), budget_source, trim(field), f_, sorted_keys, sorted_stamps)
+      call get_keys_stamps(trim(path), trim(rc), budget_source, trim(field_list(1)), f_, sorted_keys, sorted_stamps)
       num_stamps = size(sorted_keys)
     else
       num_stamps = 1
@@ -547,195 +797,236 @@ contains
     ! Mesh
     allocate(x(nx), y(ny), z(nz))
     call create_grid(Lx, Ly, Lz, nx, ny, nz, x, y, z)
-    
-    ! Figure which coordinate names to use
-    select case (ax)
-    case ('x')
-      x1name = 'y'; x2name = 'z'
-      nx1 = ny; nx2 = nz; nax = nx
-      L1 = Ly; L2 = Lz; Lax = Lx
-      x1s = ys; x1e = ye; x2s = zs; x2e = ze
-      axs = xs; axe = xe
-      eax = 'i'
-      x1 => y
-      x2 => z
-    case ('y')
-      x1name = 'x'; x2name = 'z'
-      nx1 = nx; nx2 = nz; nax = ny
-      L1 = Lx; L2 = Lz; Lax = Ly
-      x1s = xs; x1e = xe; x2s = zs; x2e = ze
-      axs = ys; axe = ye
-      eax = 'j'
-      x1 => x
-      x2 => z
-    case ('z')
-      x1name = 'x'; x2name = 'y' 
-      nx1 = nx; nx2 = ny; nax = nz
-      L1 = Lx; L2 = Ly; Lax = Lz
-      x1s = xs; x1e = xe; x2s = ys; x2e = ye
-      axs = zs; axe = ze
-      eax = 'k'
-      x1 => x
-      x2 => y
-    end select
-    delta = Lax/real(nax,rk)
 
-    ! Global slice arrays (same shape on all ranks)
-    allocate(local_slice0(nx1, nx2))
-    allocate(global_slice0(nx1, nx2))
-    if(.not. integrate)then
-      allocate(local_slice1(nx1, nx2))
-      allocate(global_slice1(nx1, nx2))
-      allocate(slice_interp(nx1, nx2))
-    end if
+      ! Loop over files first to avoid redundant multiple reads of the same file
+      timeloop: do k = 1, num_stamps
+        fields_loop : do ifield = 1, nfields
 
-    ! Loop over files first to avoid redundant multiple reads of the same file
-    timeloop: do k = 1, num_stamps
-
-      ! Either read a field or directly from a filename
-      if(filemode)then
-        f1 = reader%read_field(trim(path)//'/'//trim(filename))
-      else
-        if(.not. within_range(start_idx, end_idx, trim(sorted_keys(k)))) cycle
-        f1 = eval_field(trim(field), reader, budget_source, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-      end if
-
-      mode: if(integrate)then
-        ! Wipe clean slice arrays
-        local_slice0 = 0.0_rk
-        global_slice0 = 0.0_rk
-
-        ! Loop over the axis we integrate along
-        ! j is global index
-        do j=axs, axe
-          jloc = j - axs + 1
-          select case(ax)
-          case('x')
-            slice_ptr => f1(jloc,:,:)
-          case('y')
-            slice_ptr => f1(:,jloc,:)
-          case('z')
-            slice_ptr => f1(:,:,jloc)
-          end select
-          local_slice0(x1s:x1e, x2s:x2e) = local_slice0(x1s:x1e, x2s:x2e) + slice_ptr(:,:)*delta
-        end do
-
-        ! 3) Sum contributions from all ranks to get full global slices
-        call MPI_Allreduce(local_slice0, global_slice0, nx1*nx2, MPI_DOUBLE_PRECISION, &
-                          MPI_SUM, MPI_COMM_WORLD, ierr)
-
-        if (myrank == 0) then
-          ! Output file name
-          if(.not. filemode) then
-            call define_budget(trim(field), budget, term, budget_source, calc)
-            call create_file_name(budget_source, rc, trim(field), budget, term, trim(sorted_keys(k)), trim(sorted_stamps(k)), fname)
-            fname = trim(outdir)//'/'//trim(strip_extension(trim(fname)))
-          else
-            fname = trim(outdir)//'/'//trim(strip_extension(trim(filename)))    
-          end if
-          fname = trim(fname)//'_integ_'//trim(ax)//'.nc'
+        ! Either read a field or directly from a filename
+        if(filemode)then
+          f1 = reader%read_field(trim(path)//'/'//trim(filename))
+          field = "filebased"
+        else
+          field = trim(field_list(ifield))
+          if(.not. within_range(start_idx, end_idx, trim(sorted_keys(k)))) cycle
           
-          call message("Exporting to: "//trim(fname))
-          call export_slice_to_netcdf(trim(fname), trim(field), global_slice0, x1, x2, x1name, x2name)
+          if(myrank == 0) then
+            write(msg,'(A,I0,A,I0,A,A,A,A)') 'Reading field ', ifield, '/', nfields, &
+              ': ', trim(field), ' at time ', trim(sorted_stamps(k))
+            call message(trim(msg))
+          end if
+          if(has_s3d_extension(trim(field)))then
+            ! It is a file name. Better to have a unified approach through an external map file only.
+            f1 = reader%read_field(trim(path)//'/'//trim(field))
+          else
+            f1 = eval_field(trim(field), reader, budget_source, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
+          end if
         end if
-      
-      else
 
-        sliceloop: do isl = 1, nslice
-          slice_ = slice_coord(isl)
+        slicepackets_loop: do islice = 1, size(slice_packets)
+          ax = slice_packets(islice)%axis
+          integrate = (slice_packets(islice)%integrate == 1)
+          nslice = size(slice_packets(islice)%coords)
+
           if (myrank == 0) then
-            write(msg,'(A, I0, A, I0, A, ES12.4)') 'Slice ',isl,'/',nslice,', '//ax//' = ',slice_
+            write(msg,'(A,I0,A,I0,A,A)') 'Processing slice packet ', islice, '/', &
+              size(slice_packets), ' along axis ', ax
             call message(trim(msg))
           end if
+        
+          ! Figure which coordinate names to use
+          select case (ax)
+          case ('x')
+            x1name = 'y'; x2name = 'z'
+            nx1 = ny; nx2 = nz; nax = nx
+            L1 = Ly; L2 = Lz; Lax = Lx
+            x1s = ys; x1e = ye; x2s = zs; x2e = ze
+            axs = xs; axe = xe
+            eax = 'i'
+            x1 => y
+            x2 => z
+          case ('y')
+            x1name = 'x'; x2name = 'z'
+            nx1 = nx; nx2 = nz; nax = ny
+            L1 = Lx; L2 = Lz; Lax = Ly
+            x1s = xs; x1e = xe; x2s = zs; x2e = ze
+            axs = ys; axe = ye
+            eax = 'j'
+            x1 => x
+            x2 => z
+          case ('z')
+            x1name = 'x'; x2name = 'y' 
+            nx1 = nx; nx2 = ny; nax = nz
+            L1 = Lx; L2 = Ly; Lax = Lz
+            x1s = xs; x1e = xe; x2s = ys; x2e = ye
+            axs = zs; axe = ze
+            eax = 'k'
+            x1 => x
+            x2 => y
+          end select
+          delta = Lax/real(nax,rk)
 
-          ! Wipe clean slice arrays
-          local_slice0 = 0.0_rk; local_slice1 = 0.0_rk
-          global_slice0 = 0.0_rk; global_slice1 = 0.0_rk
-          slice_interp = 0.0_rk
-
-          ! Compute bracketing indices for z
-          call find_bracket_uniform(nax, Lax, slice_, k0, k1, alpha)
-          if (myrank == 0) then
-            write(msg,'(A, I0, A, I0, A, ES12.4)')'k0 = ',k0,', k1 = ',k1,', alpha = ',alpha
-            call message(trim(msg))
+          ! Global slice arrays (same shape on all ranks)
+          if(allocated(local_slice0)) deallocate(local_slice0)
+          allocate(local_slice0(nx1, nx2))
+          if(allocated(global_slice0)) deallocate(global_slice0)
+          allocate(global_slice0(nx1, nx2))
+          if(.not. integrate)then
+            if(allocated(local_slice1)) deallocate(local_slice1)
+            allocate(local_slice1(nx1, nx2))
+            if(allocated(global_slice1)) deallocate(global_slice1)
+            allocate(global_slice1(nx1, nx2))
+            if(allocated(slice_interp)) deallocate(slice_interp)
+            allocate(slice_interp(nx1, nx2))
           end if
 
-          ! 2) Build local contributions to the two bracketing planes
-          local_slice0 = 0.0_rk
-          local_slice1 = 0.0_rk
+          mode: if(integrate)then
+            ! Wipe clean slice arrays
+            local_slice0 = 0.0_rk
+            global_slice0 = 0.0_rk
 
-          block
-            logical :: has0, has1
-            integer :: k0_loc, k1_loc
-
-            has0 = (k0 >= axs .and. k0 <= axe)
-            has1 = (k1 >= axs .and. k1 <= axe)
-
-            if (has0) then
-              k0_loc = k0 - axs + 1
+            ! Loop over the axis we integrate along
+            ! j is global index
+            do j=axs, axe
+              jloc = j - axs + 1
               select case(ax)
               case('x')
-                slice_ptr => f1(k0_loc,:,:)
+                slice_ptr => f1(jloc,:,:)
               case('y')
-                slice_ptr => f1(:,k0_loc,:)
+                slice_ptr => f1(:,jloc,:)
               case('z')
-                slice_ptr => f1(:,:,k0_loc)
+                slice_ptr => f1(:,:,jloc)
               end select
-              local_slice0(x1s:x1e, x2s:x2e) = slice_ptr(:,:)
-            end if
-
-            if (has1) then
-              k1_loc = k1 - axs + 1
-              select case(ax)
-              case('x')
-                slice_ptr => f1(k1_loc,:,:)
-              case('y')
-                slice_ptr => f1(:,k1_loc,:)
-              case('z')
-                slice_ptr => f1(:,:,k1_loc)
-              end select
-              local_slice1(x1s:x1e, x2s:x2e) = slice_ptr(:,:)
-            end if
-          end block
-
-          ! 3) Sum contributions from all ranks to get full global slices
-          call MPI_Allreduce(local_slice0, global_slice0, nx1*nx2, MPI_DOUBLE_PRECISION, &
-                            MPI_SUM, MPI_COMM_WORLD, ierr)
-          call MPI_Allreduce(local_slice1, global_slice1, nx1*nx2, MPI_DOUBLE_PRECISION, &
-                            MPI_SUM, MPI_COMM_WORLD, ierr)
-
-          ! 4) On root: do linear interpolation and write CSV
-          if (myrank == 0) then
-            do j = 1, nx2
-              do i = 1, nx1
-                slice_interp(i,j) = (1.0_rk - alpha) * global_slice0(i,j) + alpha * global_slice1(i,j)
-              end do
+              local_slice0(x1s:x1e, x2s:x2e) = local_slice0(x1s:x1e, x2s:x2e) + slice_ptr(:,:)*delta
             end do
 
-            ! Output file name
-            if(.not. filemode) then
-              call define_budget(trim(field), budget, term, budget_source, calc)
-              call create_file_name(budget_source, rc, trim(field), budget, term, trim(sorted_keys(k)), trim(sorted_stamps(k)), fname)
-              fname = trim(outdir)//'/'//trim(strip_extension(trim(fname)))//&
-                      '_SL_'//trim(f_)//'_'//ax
-            else
-              fname = trim(outdir)//'/'//trim(strip_extension(filename))//'_SL_'//ax            
-            end if
-            if(slice_ <= -1) fname = trim(fname)//'_'//eax ! A direct index is given
-            fname = trim(fname)//'='//trim(real2string(slice_))//'.nc'      
-            
-            call message("Exporting to: "//trim(fname))
-            call export_slice_to_netcdf(trim(fname), trim(field), slice_interp, x1, x2, x1name, x2name)
+            ! 3) Sum contributions from all ranks to get full global slices
+            call MPI_Reduce(local_slice0, global_slice0, nx1*nx2, MPI_DOUBLE_PRECISION, &
+              MPI_SUM, 0, MPI_COMM_WORLD, ierr)
 
-          end if
-        end do sliceloop
-        
+            if (myrank == 0) then
+              ! Output file name
+              if(.not. filemode) then
+                if(has_s3d_extension(trim(field))) then
+                  fname = trim(outdir)//'/'//trim(strip_extension(trim(field)))
+                else
+                  call define_budget(trim(field), budget, term, budget_source, calc)
+                  call create_file_name(budget_source, rc, trim(field), budget, term, trim(sorted_keys(k)), trim(sorted_stamps(k)), fname)
+                  fname = trim(outdir)//'/'//trim(strip_extension(trim(fname)))
+                end if
+              else
+                fname = trim(outdir)//'/'//trim(strip_extension(trim(filename)))    
+              end if
+              fname = trim(fname)//'_integ_'//trim(ax)//'.nc'
+              
+              call message("Exporting to: "//trim(fname))
+              call export_slice_to_netcdf(trim(fname), trim(field), global_slice0, x1, x2, x1name, x2name)
+            end if
+          
+          else
+
+            sliceloop: do isl = 1, nslice
+              slice_ = slice_packets(islice)%coords(isl)
+              if (myrank == 0) then
+                write(msg,'(A, I0, A, I0, A, ES12.4)') 'Slice ',isl,'/',nslice,', '//ax//' = ',slice_
+                call message(trim(msg))
+              end if
+
+              ! Wipe clean slice arrays
+              local_slice0 = 0.0_rk; local_slice1 = 0.0_rk
+              global_slice0 = 0.0_rk; global_slice1 = 0.0_rk
+              slice_interp = 0.0_rk
+
+              ! Compute bracketing indices for z
+              call find_bracket_uniform(nax, Lax, slice_, k0, k1, alpha)
+              if (myrank == 0) then
+                write(msg,'(A, I0, A, I0, A, ES12.4)')'k0 = ',k0,', k1 = ',k1,', alpha = ',alpha
+                call message(trim(msg))
+              end if
+
+              ! 2) Build local contributions to the two bracketing planes
+              local_slice0 = 0.0_rk
+              local_slice1 = 0.0_rk
+
+              block
+                logical :: has0, has1
+                integer :: k0_loc, k1_loc
+
+                has0 = (k0 >= axs .and. k0 <= axe)
+                has1 = (k1 >= axs .and. k1 <= axe)
+
+                if (has0) then
+                  k0_loc = k0 - axs + 1
+                  select case(ax)
+                  case('x')
+                    slice_ptr => f1(k0_loc,:,:)
+                  case('y')
+                    slice_ptr => f1(:,k0_loc,:)
+                  case('z')
+                    slice_ptr => f1(:,:,k0_loc)
+                  end select
+                  local_slice0(x1s:x1e, x2s:x2e) = slice_ptr(:,:)
+                end if
+
+                if (has1) then
+                  k1_loc = k1 - axs + 1
+                  select case(ax)
+                  case('x')
+                    slice_ptr => f1(k1_loc,:,:)
+                  case('y')
+                    slice_ptr => f1(:,k1_loc,:)
+                  case('z')
+                    slice_ptr => f1(:,:,k1_loc)
+                  end select
+                  local_slice1(x1s:x1e, x2s:x2e) = slice_ptr(:,:)
+                end if
+              end block
+
+              ! 3) Sum contributions from all ranks to get full global slices
+              call MPI_Reduce(local_slice0, global_slice0, nx1*nx2, MPI_DOUBLE_PRECISION, &
+                MPI_SUM, 0, MPI_COMM_WORLD, ierr)
+              call MPI_Reduce(local_slice1, global_slice1, nx1*nx2, MPI_DOUBLE_PRECISION, &
+                MPI_SUM, 0, MPI_COMM_WORLD, ierr)
+
+              ! 4) On root: do linear interpolation
+              if (myrank == 0) then
+                do j = 1, nx2
+                  do i = 1, nx1
+                    slice_interp(i,j) = (1.0_rk - alpha) * global_slice0(i,j) + alpha * global_slice1(i,j)
+                  end do
+                end do
+
+                ! Output file name
+                if(.not. filemode) then
+                  if(has_s3d_extension(trim(field))) then
+                    fname = trim(outdir)//'/'//trim(strip_extension(trim(field)))//'_SL_'//ax 
+                  else
+                    call define_budget(trim(field), budget, term, budget_source, calc)
+                    call create_file_name(budget_source, rc, trim(field), budget, term, trim(sorted_keys(k)), trim(sorted_stamps(k)), fname)
+                    fname = trim(outdir)//'/'//trim(strip_extension(trim(fname)))//&
+                            '_SL_'//ax
+                  end if
+                else
+                  fname = trim(outdir)//'/'//trim(strip_extension(filename))//'_SL_'//ax            
+                end if
+                if(slice_ <= -1) fname = trim(fname)//'_'//eax ! A direct index is given
+                fname = trim(fname)//'='//trim(real2string(slice_))//'.nc'      
+                
+                call message("Exporting to: "//trim(fname))
+                call export_slice_to_netcdf(trim(fname), trim(field), slice_interp, x1, x2, x1name, x2name)
+
+              end if
+            end do sliceloop
+            
+            call MPI_Barrier(MPI_COMM_WORLD, ierr)
+            if(myrank == 0) call message(' ')
+          end if mode
+
         call MPI_Barrier(MPI_COMM_WORLD, ierr)
         if(myrank == 0) call message(' ')
-      end if mode
 
-      call MPI_Barrier(MPI_COMM_WORLD, ierr)
-      if(myrank == 0) call message(' ')
+        end do slicepackets_loop
+      end do fields_loop
     end do timeloop
 
     ! Cleanup
@@ -2358,7 +2649,44 @@ contains
       case('dy_bvp_dvp')
         b = '6'; t = '23'
       case('dz_bvp_dwp')
-        b = '6'; t = '24'    
+        b = '6'; t = '24'  
+
+      case('adv_dudw')
+        b = '7'; t = '01'
+      case('adv_dvdw')
+        b = '7'; t = '02'
+      case('adv_dwdw')
+        b = '7'; t = '03'
+      case('adv_dubw')
+        b = '7'; t = '04'
+      case('adv_dvbw')
+        b = '7'; t = '05'
+      case('adv_dwbw')
+        b = '7'; t = '06'
+      case('adv_budw')
+        b = '7'; t = '07'
+      case('adv_bvdw')
+        b = '7'; t = '08'
+      case('adv_bwdw')
+        b = '7'; t = '09'
+      case('dx_dwp_dup')
+        b = '7'; t = '16'
+      case('dy_dwp_dvp')
+        b = '7'; t = '17'
+      case('dz_dwp_dwp')
+        b = '7'; t = '18'
+      case('dx_dwp_bup')
+        b = '7'; t = '19'
+      case('dy_dwp_bvp')
+        b = '7'; t = '20'
+      case('dz_dwp_bwp')
+        b = '7'; t = '21'
+      case('dx_bwp_dup')
+        b = '7'; t = '22'
+      case('dy_bwp_dvp')
+        b = '7'; t = '23'
+      case('dz_bwp_dwp')
+        b = '7'; t = '24'   
   
       case default
         b = '0'; t = '01'; calc = .true.     
@@ -3276,22 +3604,18 @@ program MPIR3D_
   type(FieldReader2Decomp) :: reader
   integer :: ierr
   character(len=256) :: path, outdir
-  character(len=256) :: field
-  integer :: nx=1, ny=1, nz=1, runid=1, taskid=0, num_slice=1, abl_type=0
+  character(len=256) :: field, slice_map
+  integer :: nx=1, ny=1, nz=1, runid=1, taskid=0, abl_type=0
   real(rk) :: Lx=1.0_rk, Ly=1.0_rk, Lz=1.0_rk
   real(rk) :: x1=-1._rk, x2=-1._rk, y1=-1._rk, y2=-1._rk, z1=-1._rk, z2=-1._rk
   integer :: nlen, ioUnit=28
   character(:), allocatable :: inputfile
-  character(len=1) :: slice_axis = 'z'
-  real(rk) :: slice_coord(1000)
-  real(rk), allocatable :: slice_coord_(:)
   integer :: budget_source, nxloc, nyloc, nzloc
   character(len=256) :: filename = 'null'
   integer :: start_idx=0, end_idx=huge(1)
-  logical :: integrate = .false.
   namelist /SETUP/ nx, ny, nz, Lx, Ly, Lz, path, outdir, runid, taskid, field, &
-                   slice_axis, num_slice, slice_coord, budget_source, filename, &
-                   start_idx, end_idx, abl_type, integrate
+                   slice_map, budget_source, filename, &
+                   start_idx, end_idx, abl_type
   namelist /BOX/ x1, x2, y1, y2, z1, z2
       
   ! Initiate MPI
@@ -3318,12 +3642,6 @@ program MPIR3D_
   read(unit=ioUnit, NML=BOX)
   close(ioUnit)
 
-  if (taskid == 1)then
-    if(allocated(slice_coord_))deallocate(slice_coord_)
-    allocate(slice_coord_(num_slice))
-    slice_coord_ = slice_coord(1:num_slice)
-  end if
-
   ! Initiate reader
   call reader%init(nx, ny, nz)
   call reader%local_shape(nxloc, nyloc, nzloc)
@@ -3338,16 +3656,16 @@ program MPIR3D_
   else if (taskid == 1) then
     ! Slice
     call slice_driver(reader, Lx, Ly, Lz, runid, trim(path), trim(outdir), trim(field), &
-      slice_axis, num_slice, slice_coord_, budget_source, start_idx, end_idx, trim(filename), integrate)
+      trim(slice_map), budget_source, start_idx, end_idx, trim(filename))
   else if (taskid == -1) then
     ! Miscellaneous tasks
     call miscellaneous_driver(reader, runid, trim(field), trim(path), start_idx, end_idx)
   else if (taskid == 2)then
     call compute_abl(reader, Lx, Ly, Lz, runid, runid-1, budget_source, abl_type, trim(path), trim(outdir), start_idx, end_idx)
   else if (taskid == 3)then
-    call one_d_profile(reader, Lx, Ly, Lz, runid, budget_source, trim(path), &
-         trim(outdir), trim(field), start_idx, end_idx, trim(filename), slice_axis, &
-         x1, x2, y1, y2, z1, z2)
+    ! call one_d_profile(reader, Lx, Ly, Lz, runid, budget_source, trim(path), &
+    !      trim(outdir), trim(field), start_idx, end_idx, trim(filename), slice_axis, &
+    !      x1, x2, y1, y2, z1, z2)
   else if (taskid == 4)then
     call max_time_change(reader, runid, trim(path), trim(field), &
       budget_source, start_idx, end_idx)
