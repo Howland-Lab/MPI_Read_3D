@@ -9,7 +9,7 @@ module MPIR3D
   use decomp_2d, only: decomp_info, decomp_2d_init, xstart, &
                        xend, ystart, yend, zstart, zend, &
                        decomp_2d_finalize, decomp_info_init, &
-                       mytype
+                       mytype, transpose_x_to_y, transpose_y_to_z
   implicit none
 
   integer, parameter :: rk = mytype
@@ -33,9 +33,9 @@ module MPIR3D
      integer :: p_row = 0, p_col = 0
      logical :: is_init = .false.
 
-     ! 2DECOMP&FFT descriptor (x-pencil)
-     type(DECOMP_INFO) :: d
-
+     ! 2DECOMP&FFT descriptor (x-pencil; cell based)
+     type(DECOMP_INFO) :: gpC
+     
      ! Local extents for x-pencil
      integer :: xs=0, xe=0, ys=0, ye=0, zs=0, ze=0
      integer :: nxloc=0, nyloc=0, nzloc=0
@@ -57,7 +57,363 @@ module MPIR3D
      integer :: integrate = 0
   end type slice_packet_t
 
+  type :: rz_params
+    real(rk) :: tm
+    real(rk) :: a
+    real(rk) :: b
+    real(rk) :: l
+    real(rk) :: d
+    real(rk) :: sse
+    integer  :: status
+  end type rz_params
+
 contains
+
+  pure real(rk) function f_basis(x)
+    real(rk), intent(in) :: x
+    f_basis = 0.5_rk * (tanh(x) + 1.0_rk)
+  end function f_basis
+
+  pure real(rk) function log_2cosh_stable(x)
+    real(rk), intent(in) :: x
+
+    ! log(2 cosh x) = log(exp(x) + exp(-x))
+    ! Stable implementation avoiding overflow.
+    if (x >= 0.0_rk) then
+        log_2cosh_stable = x + log(1.0_rk + exp(-2.0_rk*x))
+    else
+        log_2cosh_stable = -x + log(1.0_rk + exp(2.0_rk*x))
+    end if
+  end function log_2cosh_stable
+
+  pure real(rk) function g_basis(x)
+    real(rk), intent(in) :: x
+    g_basis = 0.5_rk * (log_2cosh_stable(x) + x)
+  end function g_basis
+
+  subroutine fit_rz_profile(z, t, n, l0, d0, params, d_min, ridge, max_iter, tol)
+    integer,  intent(in)  :: n
+    real(rk), intent(in)  :: z(n), t(n)
+    real(rk), intent(in)  :: l0, d0
+    type(rz_params), intent(out) :: params
+
+    real(rk), intent(in), optional :: d_min
+    real(rk), intent(in), optional :: ridge
+    integer,  intent(in), optional :: max_iter
+    real(rk), intent(in), optional :: tol
+
+    real(rk) :: dmin_loc, ridge_loc, tol_loc
+    integer  :: max_iter_loc
+
+    real(rk) :: x(2,3), fval(3)
+    real(rk) :: centroid(2), xr(2), xe(2), xc(2)
+    real(rk) :: fr, fe, fc
+    real(rk) :: alpha, gamma, rho, sigma
+    real(rk) :: scale_l, scale_d, z_range, simplex_size
+    integer :: iter
+    integer :: i_best, i_worst, i_mid
+    integer :: stat
+
+    dmin_loc = 1.0e-6_rk
+    ridge_loc = 0.0_rk
+    max_iter_loc = 500
+    tol_loc = 1.0e-8_rk
+
+    if (present(d_min))   dmin_loc = d_min
+    if (present(ridge))   ridge_loc = ridge
+    if (present(max_iter)) max_iter_loc = max_iter
+    if (present(tol))     tol_loc = tol
+
+    alpha = 1.0_rk   ! reflection
+    gamma = 2.0_rk   ! expansion
+    rho   = 0.5_rk   ! contraction
+    sigma = 0.5_rk   ! shrink
+
+    ! Initial simplex in the two nonlinear variables: x = [l, d].
+    z_range = maxval(z) - minval(z)
+    if (z_range <= 0.0_rk) then
+        params%status = -2
+        return
+    end if
+    scale_l = max(10.0_rk * dmin_loc, 0.05_rk * z_range)
+    scale_d = max(10.0_rk * dmin_loc, 0.10_rk * z_range)
+    
+    x(:,1) = [l0, max(d0, dmin_loc)]
+    x(:,2) = [l0 + scale_l, max(d0, dmin_loc)]
+    x(:,3) = [l0, max(d0 + scale_d, dmin_loc)]
+
+    do i_best = 1, 3
+        fval(i_best) = objective(z, t, n, x(1,i_best), x(2,i_best), dmin_loc, ridge_loc, stat)
+    end do
+
+    do iter = 1, max_iter_loc
+
+        call order_simplex(fval, i_best, i_mid, i_worst)
+
+        simplex_size = maxval(abs(x - spread(x(:,i_best), 2, 3)))
+
+        if (maxval(abs(fval - fval(i_best))) < tol_loc * (1.0_rk + abs(fval(i_best)))) exit
+        if (simplex_size < tol_loc * max(1.0_rk, z_range)) exit
+
+        centroid = 0.5_rk * (x(:,i_best) + x(:,i_mid))
+
+        ! Reflection
+        xr = centroid + alpha * (centroid - x(:,i_worst))
+        xr(2) = max(xr(2), dmin_loc)
+        fr = objective(z, t, n, xr(1), xr(2), dmin_loc, ridge_loc, stat)
+
+        if (fr < fval(i_best)) then
+            ! Expansion
+            xe = centroid + gamma * (xr - centroid)
+            xe(2) = max(xe(2), dmin_loc)
+            fe = objective(z, t, n, xe(1), xe(2), dmin_loc, ridge_loc, stat)
+
+            if (fe < fr) then
+                x(:,i_worst) = xe
+                fval(i_worst) = fe
+            else
+                x(:,i_worst) = xr
+                fval(i_worst) = fr
+            end if
+
+        else if (fr < fval(i_mid)) then
+            x(:,i_worst) = xr
+            fval(i_worst) = fr
+
+        else
+            ! Contraction
+            if (fr < fval(i_worst)) then
+                xc = centroid + rho * (xr - centroid)
+            else
+                xc = centroid + rho * (x(:,i_worst) - centroid)
+            end if
+
+            xc(2) = max(xc(2), dmin_loc)
+            fc = objective(z, t, n, xc(1), xc(2), dmin_loc, ridge_loc, stat)
+
+            if (fc < fval(i_worst)) then
+                x(:,i_worst) = xc
+                fval(i_worst) = fc
+            else
+                ! Shrink toward best point
+                x(:,i_mid)   = x(:,i_best) + sigma * (x(:,i_mid)   - x(:,i_best))
+                x(:,i_worst) = x(:,i_best) + sigma * (x(:,i_worst) - x(:,i_best))
+
+                x(2,i_mid)   = max(x(2,i_mid), dmin_loc)
+                x(2,i_worst) = max(x(2,i_worst), dmin_loc)
+
+                fval(i_mid) = objective(z, t, n, x(1,i_mid), x(2,i_mid), dmin_loc, ridge_loc, stat)
+                fval(i_worst) = objective(z, t, n, x(1,i_worst), x(2,i_worst), dmin_loc, ridge_loc, stat)
+            end if
+        end if
+    end do
+
+    call order_simplex(fval, i_best, i_mid, i_worst)
+
+    params%l = x(1,i_best)
+    params%d = x(2,i_best)
+    params%sse = fval(i_best)
+
+    call solve_tmab(z, t, n, params%l, params%d, ridge_loc, params%tm, params%a, params%b, stat)
+
+    params%status = stat
+    if (iter > max_iter_loc) params%status = 1
+  end subroutine fit_rz_profile
+
+  real(rk) function objective(z, t, n, l, d, d_min, ridge, status)
+    integer,  intent(in)  :: n
+    real(rk), intent(in)  :: z(n), t(n)
+    real(rk), intent(in)  :: l, d, d_min, ridge
+    integer,  intent(out) :: status
+
+    real(rk) :: tm, a, b
+    real(rk) :: eta, t_fit, res
+    integer :: i
+
+    if (d <= d_min) then
+        objective = huge(1.0_rk)
+        status = -1
+        return
+    end if
+
+    call solve_tmab(z, t, n, l, d, ridge, tm, a, b, status)
+
+    if (status /= 0) then
+        objective = huge(1.0_rk)
+        return
+    end if
+
+    objective = 0.0_rk
+
+    do i = 1, n
+        eta = (z(i) - l) / d
+        t_fit = tm + a * f_basis(eta) + b * g_basis(eta)
+        res = t(i) - t_fit
+        objective = objective + res * res
+    end do
+  end function objective
+
+  subroutine solve_tmab(z, t, n, l, d, ridge, tm, a, b, status)
+    integer,  intent(in)  :: n
+    real(rk), intent(in)  :: z(n), t(n)
+    real(rk), intent(in)  :: l, d, ridge
+    real(rk), intent(out) :: tm, a, b
+    integer,  intent(out) :: status
+
+    real(rk) :: M(3,3), rhs(3), sol(3)
+    real(rk) :: eta, fv, gv
+    real(rk) :: S1, Sf, Sg, Sff, Sgg, Sfg
+    real(rk) :: St, Sft, Sgt
+    integer :: i
+
+    S1  = real(n, rk)
+    Sf  = 0.0_rk
+    Sg  = 0.0_rk
+    Sff = 0.0_rk
+    Sgg = 0.0_rk
+    Sfg = 0.0_rk
+    St  = 0.0_rk
+    Sft = 0.0_rk
+    Sgt = 0.0_rk
+
+    do i = 1, n
+        eta = (z(i) - l) / d
+        fv = f_basis(eta)
+        gv = g_basis(eta)
+
+        Sf  = Sf  + fv
+        Sg  = Sg  + gv
+        Sff = Sff + fv * fv
+        Sgg = Sgg + gv * gv
+        Sfg = Sfg + fv * gv
+
+        St  = St  + t(i)
+        Sft = Sft + fv * t(i)
+        Sgt = Sgt + gv * t(i)
+    end do
+
+    M(1,:) = [S1, Sf,  Sg]
+    M(2,:) = [Sf, Sff, Sfg]
+    M(3,:) = [Sg, Sfg, Sgg]
+
+    if (ridge > 0.0_rk) then
+        M(1,1) = M(1,1) + ridge
+        M(2,2) = M(2,2) + ridge
+        M(3,3) = M(3,3) + ridge
+    end if
+
+    rhs = [St, Sft, Sgt]
+
+    call solve_3x3(M, rhs, sol, status)
+
+    if (status == 0) then
+        tm = sol(1)
+        a  = sol(2)
+        b  = sol(3)
+    else
+        tm = 0.0_rk
+        a  = 0.0_rk
+        b  = 0.0_rk
+    end if
+  end subroutine solve_tmab
+
+  subroutine solve_3x3(Ain, bin, x, status)
+    real(rk), intent(in)  :: Ain(3,3), bin(3)
+    real(rk), intent(out) :: x(3)
+    integer,  intent(out) :: status
+
+    real(rk) :: A(3,3), b(3)
+    real(rk) :: factor, tmp, pivot_abs
+    integer :: i, j, k, p
+
+    A = Ain
+    b = bin
+    status = 0
+
+    do k = 1, 2
+        p = k
+        pivot_abs = abs(A(k,k))
+
+        do i = k+1, 3
+            if (abs(A(i,k)) > pivot_abs) then
+                p = i
+                pivot_abs = abs(A(i,k))
+            end if
+        end do
+
+        if (pivot_abs < 1.0e-14_rk) then
+            status = -1
+            x = 0.0_rk
+            return
+        end if
+
+        if (p /= k) then
+            do j = k, 3
+                tmp = A(k,j)
+                A(k,j) = A(p,j)
+                A(p,j) = tmp
+            end do
+
+            tmp = b(k)
+            b(k) = b(p)
+            b(p) = tmp
+        end if
+
+        do i = k+1, 3
+            factor = A(i,k) / A(k,k)
+            A(i,k) = 0.0_rk
+
+            do j = k+1, 3
+                A(i,j) = A(i,j) - factor * A(k,j)
+            end do
+
+            b(i) = b(i) - factor * b(k)
+        end do
+    end do
+
+    if (abs(A(3,3)) < 1.0e-14_rk) then
+        status = -1
+        x = 0.0_rk
+        return
+    end if
+
+    x(3) = b(3) / A(3,3)
+    x(2) = (b(2) - A(2,3) * x(3)) / A(2,2)
+    x(1) = (b(1) - A(1,2) * x(2) - A(1,3) * x(3)) / A(1,1)
+  end subroutine solve_3x3
+
+  subroutine order_simplex(fval, i_best, i_mid, i_worst)
+    real(rk), intent(in)  :: fval(3)
+    integer,  intent(out) :: i_best, i_mid, i_worst
+
+    integer :: idx(3), i, j, tmp
+
+    idx = [1, 2, 3]
+
+    do i = 1, 2
+        do j = i+1, 3
+            if (fval(idx(j)) < fval(idx(i))) then
+                tmp = idx(i)
+                idx(i) = idx(j)
+                idx(j) = tmp
+            end if
+        end do
+    end do
+
+    i_best  = idx(1)
+    i_mid   = idx(2)
+    i_worst = idx(3)
+  end subroutine order_simplex
+
+  pure real(rk) function eval_rz_profile(z, params)
+    real(rk), intent(in) :: z
+    type(rz_params), intent(in) :: params
+
+    real(rk) :: eta
+
+    eta = (z - params%l) / params%d
+    eval_rz_profile = params%tm + params%a * f_basis(eta) + params%b * g_basis(eta)
+  end function eval_rz_profile
 
   subroutine read_slice_map(filename, packets, ierr)
     implicit none
@@ -257,7 +613,7 @@ contains
     end if
 
     call decomp_2d_init(this%nx, this%ny, this%nz, this%p_row, this%p_col)
-    call decomp_info_init(this%nx, this%ny, this%nz, this%d)
+    call decomp_info_init(this%nx, this%ny, this%nz, this%gpC)
     
     ! Cache local extents
     this%xs = xstart(1); this%xe = xend(1)
@@ -305,7 +661,7 @@ contains
     end if
 
     if (myrank == 0) call message('Reading from: '//path(:len_trim(path)))
-    call decomp_2d_read_one(1, field, path, this%d)
+    call decomp_2d_read_one(1, field, path, this%gpC)
   end function frd_read_field
 
   ! Get global shape
@@ -1203,19 +1559,19 @@ contains
     end do
   end subroutine
 
-  subroutine compute_abl(reader, Lx, Ly, Lz, runid, baserunid, budget_source, abl_type, path, outdir, start_idx, end_idx)
+  subroutine compute_abl(reader, Lx, Ly, Lz, runid, baserunid, budget_source, abl_type, path, outdir, start_idx, end_idx, lengthscale)
     implicit none
     class(FieldReader2Decomp), intent(inout) :: reader
     integer,          intent(in)  :: runid, baserunid
     integer,          intent(in)  :: start_idx, end_idx, budget_source, abl_type
-    real(rk),         intent(in)  :: Lx, Ly, Lz
+    real(rk),         intent(in)  :: Lx, Ly, Lz, lengthscale
     character(*),     intent(in)  :: path, outdir    
     character(len=2) :: rc, rcbase
     integer :: nx, ny, nz
     integer :: nxloc, nyloc, nzloc
     integer :: xs, xe, ys, ye, zs, ze  
     real(rk), allocatable :: uw(:,:,:), vw(:,:,:), buffer(:,:,:), zcross(:,:), zcross_global(:,:)
-    real(rk), allocatable :: x(:), y(:), z(:)
+    real(rk), allocatable :: x(:), y(:), z(:), z_in_m(:)
     character(len=256) :: f_, fname, Lxc, Lyc, Lzc
     character(len=:), allocatable :: sorted_keys(:), sorted_stamps(:)
     character(1) :: method
@@ -1325,34 +1681,144 @@ contains
 
         ! ABL height
         call find_threshold_crossing_z(buffer, z, zcross(xs:xe, ys:ye), 0.05_rk, 0.0_rk)
+
+        ! MPI exchange
+        call MPI_Reduce(zcross, zcross_global, nx*ny, MPI_DOUBLE_PRECISION, &
+                  MPI_SUM, 0, MPI_COMM_WORLD, ierr)
+
+        if(myrank == 0)then
+          write(method, '(I1.1)')abl_type
+          fname = trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//'_SL_BLH_M'//method//'.nc' 
+          call message('Exporting to: '//trim(fname))
+          call export_slice_to_netcdf(trim(fname), 'BLH', zcross_global, x, y, 'x', 'y')
+        end if
+      
       else if (abl_type == 1)then
 
         ! Read temperature vertical gradient
+        ! if(budget_source == 1)then
+        !   buffer = reader%read_field(trim(path)//'/ddz_Run'//trim(rc)//'_budget0_term26_t'//trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D')
+        ! else
+        !   ! Base
+        !   uw = reader%read_field(trim(path)//'/ddz_Run'//trim(rcbase)//'_budget0_term26_t'//trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D')
+        !   buffer = buffer + uw
+
+        !   uw = reader%read_field(trim(path)//'/ddz_Run'//trim(rc)//'_comp_deficit_budget0_term05_t'//trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D')
+        !   buffer = buffer + uw
+        ! end if 
+
+        ! ! Now buffer holds d(theta)/dz
+        ! call find_capping_inversion(buffer, z, zcross(xs:xe, ys:ye), 0.15_rk)   
+
+        ! Read temperature
         if(budget_source == 1)then
-          buffer = reader%read_field(trim(path)//'/ddz_Run'//trim(rc)//'_budget0_term26_t'//trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D')
+          buffer = reader%read_field(trim(path)//'/Run'//trim(rc)//'_budget0_term26_t'//trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D')
         else
           ! Base
-          uw = reader%read_field(trim(path)//'/ddz_Run'//trim(rcbase)//'_budget0_term26_t'//trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D')
-          buffer = buffer + uw
+          uw = reader%read_field(trim(path)//'/Run'//trim(rcbase)//'_budget0_term26_t'//trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D')
+          buffer = uw
 
-          uw = reader%read_field(trim(path)//'/ddz_Run'//trim(rc)//'_comp_deficit_budget0_term05_t'//trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D')
-          buffer = buffer + uw
+          uw = reader%read_field(trim(path)//'/Run'//trim(rc)//'_comp_deficit_budget0_term05_t'//trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D')
+          buffer = buffer + uw ! Full
         end if 
 
-        ! Now buffer holds d(theta)/dz
-        call find_capping_inversion(buffer, z, zcross(xs:xe, ys:ye), 0.15_rk)       
+        block
+          real(rk), allocatable :: ytmp(:,:,:), ztmp(:,:,:)
+          real(rk), allocatable :: h0map(:,:), h2map(:,:), GMAP(:,:)
+          integer :: ic, jc, ig, jg
+          type(rz_params) :: params
+          real(rk) :: l0, d0, h0, h2
+          real(rk) :: xi
+          real(rk), allocatable :: tcol(:)
+
+          allocate(ytmp(reader%gpC%ysz(1), reader%gpC%ysz(2), reader%gpC%ysz(3)))
+          allocate(ztmp(reader%gpC%zsz(1), reader%gpC%zsz(2), reader%gpC%zsz(3)))
+          allocate(h0map(nx, ny))
+          allocate(h2map(nx, ny))
+          allocate(GMAP(nx, ny))
+          allocate(tcol(nz))
+          allocate(z_in_m(nz))
+
+          z_in_m = z * lengthscale
+
+          call transpose_x_to_y(buffer, ytmp, reader%gpC)
+          call transpose_y_to_z(ytmp, ztmp, reader%gpC)
+
+          if (reader%gpC%zsz(3) /= nz) then
+              if (myrank == 0) call message('ERROR: z-pencil third dimension is not full nz.')
+              call MPI_Abort(MPI_COMM_WORLD, 222, ierr)
+          end if
+
+          l0 = 700.0_rk
+          d0 = 200.0_rk
+          xi = 1.3_rk
+
+          h0map = 0.0_rk
+          h2map = 0.0_rk
+
+          do ic = 1, reader%gpC%zsz(1)
+            do jc = 1, reader%gpC%zsz(2)
+              ig = reader%gpC%zst(1) + ic - 1
+              jg = reader%gpC%zst(2) + jc - 1
+              tcol = ztmp(ic,jc,:)
+
+              call fit_rz_profile( &
+                  z_in_m, tcol, nz, l0, d0, params, &
+                  d_min   = 1.0e-6_rk, &
+                  ridge   = 1.0e-12_rk, &
+                  max_iter = 1000, &
+                  tol     = 1.0e-10_rk &
+              )
+              
+              if (params%status == 0) then
+                  h0 = params%l - xi * params%d
+                  h2 = params%l + xi * params%d
+              else
+                  h0 = 0.0_rk
+                  h2 = 0.0_rk
+              end if
+
+              h0map(ig,jg) = h0
+              h2map(ig,jg) = h2
+            end do
+          end do
+
+          ! Write h0
+          GMAP = 0.0_rk
+          ! MPI exchange
+          call MPI_Reduce(h0map, GMAP, nx*ny, MPI_DOUBLE_PRECISION, &
+                    MPI_SUM, 0, MPI_COMM_WORLD, ierr)
+          if(myrank == 0)then
+            fname = trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//'_INVH0.nc' 
+            call message('Exporting to: '//trim(fname))
+            call export_slice_to_netcdf(trim(fname), 'INVH0', GMAP, x, y, 'x', 'y')
+          end if
+
+          ! Write h2
+          GMAP = 0.0_rk
+          ! MPI exchange
+          call MPI_Reduce(h2map, GMAP, nx*ny, MPI_DOUBLE_PRECISION, &
+                    MPI_SUM, 0, MPI_COMM_WORLD, ierr)
+          if(myrank == 0)then
+            fname = trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//'_INVH2.nc' 
+            call message('Exporting to: '//trim(fname))
+            call export_slice_to_netcdf(trim(fname), 'INVH2', GMAP, x, y, 'x', 'y')
+          end if
+          deallocate(ytmp, ztmp, h0map, h2map, GMAP)
+        end block    
       end if 
-
-      ! MPI exchange
-      call MPI_Allreduce(zcross, zcross_global, nx*ny, MPI_DOUBLE_PRECISION, &
-                    MPI_SUM, MPI_COMM_WORLD, ierr)
-
-      write(method, '(I1.1)')abl_type
-      fname = trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//'_SL_BLH_M'//method//'.nc' 
-      if(myrank == 0) call message('Exporting to: '//trim(fname))
-
-      call export_slice_to_netcdf(trim(fname), 'BLH', zcross_global, x, y, 'x', 'y')
     end do
+
+    if (allocated(uw)) deallocate(uw)
+    if (allocated(vw)) deallocate(vw)
+    if (allocated(buffer)) deallocate(buffer)
+    if (allocated(zcross)) deallocate(zcross)
+    if (allocated(zcross_global)) deallocate(zcross_global)
+    if (allocated(x)) deallocate(x)
+    if (allocated(y)) deallocate(y)
+    if (allocated(z)) deallocate(z)
+    if (allocated(sorted_keys)) deallocate(sorted_keys)
+    if (allocated(sorted_stamps)) deallocate(sorted_stamps)
   end subroutine
 
   subroutine find_capping_inversion(field, z, zcross, alpha)
@@ -3608,6 +4074,7 @@ program MPIR3D_
   integer :: nx=1, ny=1, nz=1, runid=1, taskid=0, abl_type=0
   real(rk) :: Lx=1.0_rk, Ly=1.0_rk, Lz=1.0_rk
   real(rk) :: x1=-1._rk, x2=-1._rk, y1=-1._rk, y2=-1._rk, z1=-1._rk, z2=-1._rk
+  real(rk) :: lengthscale=1.0_rk
   integer :: nlen, ioUnit=28
   character(:), allocatable :: inputfile
   integer :: budget_source, nxloc, nyloc, nzloc
@@ -3615,7 +4082,7 @@ program MPIR3D_
   integer :: start_idx=0, end_idx=huge(1)
   namelist /SETUP/ nx, ny, nz, Lx, Ly, Lz, path, outdir, runid, taskid, field, &
                    slice_map, budget_source, filename, &
-                   start_idx, end_idx, abl_type
+                   start_idx, end_idx, abl_type, lengthscale
   namelist /BOX/ x1, x2, y1, y2, z1, z2
       
   ! Initiate MPI
@@ -3661,7 +4128,7 @@ program MPIR3D_
     ! Miscellaneous tasks
     call miscellaneous_driver(reader, runid, trim(field), trim(path), start_idx, end_idx)
   else if (taskid == 2)then
-    call compute_abl(reader, Lx, Ly, Lz, runid, runid-1, budget_source, abl_type, trim(path), trim(outdir), start_idx, end_idx)
+    call compute_abl(reader, Lx, Ly, Lz, runid, runid-1, budget_source, abl_type, trim(path), trim(outdir), start_idx, end_idx, lengthscale)
   else if (taskid == 3)then
     ! call one_d_profile(reader, Lx, Ly, Lz, runid, budget_source, trim(path), &
     !      trim(outdir), trim(field), start_idx, end_idx, trim(filename), slice_axis, &
