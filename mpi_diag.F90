@@ -1571,7 +1571,7 @@ contains
     integer :: nxloc, nyloc, nzloc
     integer :: xs, xe, ys, ye, zs, ze  
     real(rk), allocatable :: uw(:,:,:), vw(:,:,:), buffer(:,:,:), zcross(:,:), zcross_global(:,:)
-    real(rk), allocatable :: x(:), y(:), z(:), z_in_m(:)
+    real(rk), allocatable :: x(:), y(:), z(:)
     character(len=256) :: f_, fname, Lxc, Lyc, Lzc
     character(len=:), allocatable :: sorted_keys(:), sorted_stamps(:)
     character(1) :: method
@@ -1729,8 +1729,8 @@ contains
           type(rz_params) :: params
           real(rk) :: l0, d0, h0, h2
           real(rk) :: xi
-          real(rk), allocatable :: tcol(:)
-
+          real(rk), allocatable :: tcol(:), z_in_m(:)
+          
           allocate(ytmp(reader%gpC%ysz(1), reader%gpC%ysz(2), reader%gpC%ysz(3)))
           allocate(ztmp(reader%gpC%zsz(1), reader%gpC%zsz(2), reader%gpC%zsz(3)))
           allocate(h0map(nx, ny))
@@ -1786,8 +1786,7 @@ contains
           ! Write h0
           GMAP = 0.0_rk
           ! MPI exchange
-          call MPI_Reduce(h0map, GMAP, nx*ny, MPI_DOUBLE_PRECISION, &
-                    MPI_SUM, 0, MPI_COMM_WORLD, ierr)
+          call MPI_Reduce(h0map, GMAP, nx*ny, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
           if(myrank == 0)then
             fname = trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//'_INVH0.nc' 
             call message('Exporting to: '//trim(fname))
@@ -1797,14 +1796,13 @@ contains
           ! Write h2
           GMAP = 0.0_rk
           ! MPI exchange
-          call MPI_Reduce(h2map, GMAP, nx*ny, MPI_DOUBLE_PRECISION, &
-                    MPI_SUM, 0, MPI_COMM_WORLD, ierr)
+          call MPI_Reduce(h2map, GMAP, nx*ny, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
           if(myrank == 0)then
             fname = trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//'_INVH2.nc' 
             call message('Exporting to: '//trim(fname))
             call export_slice_to_netcdf(trim(fname), 'INVH2', GMAP, x, y, 'x', 'y')
           end if
-          deallocate(ytmp, ztmp, h0map, h2map, GMAP)
+          deallocate(ytmp, ztmp, h0map, h2map, GMAP, z_in_m, tcol)
         end block    
       end if 
     end do
