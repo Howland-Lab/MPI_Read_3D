@@ -1559,265 +1559,236 @@ contains
     end do
   end subroutine
 
-  subroutine compute_abl(reader, Lx, Ly, Lz, runid, baserunid, budget_source, abl_type, path, outdir, start_idx, end_idx, lengthscale)
+  ! ─────────────────────────────────────────────────────────────────────────────
+  ! Build the grid, discover time frames, and route each snapshot
+  !             to the appropriate ABL-height method.
+  ! ─────────────────────────────────────────────────────────────────────────────
+  subroutine compute_abl(reader, Lx, Ly, Lz, runid, baserunid, budget_source, abl_type, &
+                          path, outdir, start_idx, end_idx, lengthscale)
     implicit none
     class(FieldReader2Decomp), intent(inout) :: reader
-    integer,          intent(in)  :: runid, baserunid
-    integer,          intent(in)  :: start_idx, end_idx, budget_source, abl_type
-    real(rk),         intent(in)  :: Lx, Ly, Lz, lengthscale
-    character(*),     intent(in)  :: path, outdir    
-    character(len=2) :: rc, rcbase
-    integer :: nx, ny, nz
-    integer :: nxloc, nyloc, nzloc
-    integer :: xs, xe, ys, ye, zs, ze  
-    real(rk), allocatable :: uw(:,:,:), vw(:,:,:), buffer(:,:,:), zcross(:,:), zcross_global(:,:)
-    real(rk), allocatable :: x(:), y(:), z(:)
-    character(len=256) :: f_, fname, Lxc, Lyc, Lzc
+    integer,          intent(in) :: runid, baserunid
+    integer,          intent(in) :: start_idx, end_idx, budget_source, abl_type
+    real(rk),         intent(in) :: Lx, Ly, Lz, lengthscale
+    character(*),     intent(in) :: path, outdir
+
+    character(len=2)              :: rc, rcbase
+    integer                       :: nx, ny, nz, k
+    real(rk),         allocatable :: x(:), y(:), z(:)
+    character(len=256)            :: f_, Lxc, Lyc, Lzc
     character(len=:), allocatable :: sorted_keys(:), sorted_stamps(:)
-    character(1) :: method
-    integer :: k, ierr
-    
-    ! Convert runid to character
-    write(rc, '(I2.2)') runid
+
+    write(rc,     '(I2.2)') runid
     write(rcbase, '(I2.2)') baserunid
 
-    ! Shapes and local indices
-    call reader%local_shape(nxloc, nyloc, nzloc)
+    ! Global grid
     call reader%global_shape(nx, ny, nz)
-    call reader%indices(xs, xe, ys, ye, zs, ze)
-    allocate(uw(nxloc, nyloc, nzloc))
-    allocate(vw(nxloc, nyloc, nzloc))
-    allocate(buffer(nxloc, nyloc, nzloc))
-    allocate(zcross(nx, ny))
-    allocate(zcross_global(nx, ny))
-
     allocate(x(nx), y(ny), z(nz))
     call create_grid(Lx, Ly, Lz, nx, ny, nz, x, y, z)
-    
+
     if (myrank == 0) then
-      write(Lxc, '(F10.3)') Lx
-      call message('Domain length is '//trim(Lxc))
-      write(Lyc, '(F10.3)') Ly
-      call message('Domain width is '//trim(Lyc))
-      write(Lzc, '(F10.3)') Lz
-      call message('Domain height is '//trim(Lzc))
+      write(Lxc, '(F10.3)') Lx;  call message('Domain length is '//trim(Lxc))
+      write(Lyc, '(F10.3)') Ly;  call message('Domain width  is '//trim(Lyc))
+      write(Lzc, '(F10.3)') Lz;  call message('Domain height is '//trim(Lzc))
     end if
 
-    if(budget_source == 1)then
-      call get_keys_stamps(trim(path), trim(rc), 1, 'R13', f_, sorted_keys, sorted_stamps)
+    ! Discover available time frames
+    if (budget_source == 1) then
+      call get_keys_stamps(trim(path), trim(rc), 1, 'R13',     f_, sorted_keys, sorted_stamps)
     else
       call get_keys_stamps(trim(path), trim(rc), 3, 'dup_dwp', f_, sorted_keys, sorted_stamps)
-    end if   
-    
-    ! Loop over time snapshots
+    end if
+
+    ! Process each snapshot within the requested range
     do k = 1, size(sorted_keys)
+      if (.not. within_range(start_idx, end_idx, trim(sorted_keys(k)))) cycle
 
-      if(.not. within_range(start_idx, end_idx, trim(sorted_keys(k)))) cycle
+      select case (abl_type)
+      case (0)
+        call compute_abl_stress(reader, nx, ny, rc, rcbase, budget_source, &
+                                path, outdir, sorted_keys(k), sorted_stamps(k), x, y, z)
+      case (1)
+        call compute_abl_inversion(reader, nx, ny, nz, rc, rcbase, budget_source, &
+                   path, outdir, sorted_keys(k), sorted_stamps(k), x, y, z, lengthscale)
+      end select
+    end do
+  end subroutine compute_abl
 
-      uw = 0.0_rk
-      vw = 0.0_rk
-      buffer = 0.0_rk
-      zcross = 0.0_rk
-      zcross_global = 0.0_rk
+  ! ─────────────────────────────────────────────────────────────────────────────
+  ! Stress-based ABL height  (abl_type == 0)
+  !
+  ! Locates the height where the total (resolved + SGS) shear stress magnitude
+  ! drops to 5 % of its near-surface value.
+  ! ─────────────────────────────────────────────────────────────────────────────
+  subroutine compute_abl_stress(reader, nx, ny, rc, rcbase, budget_source, &
+                                path, outdir, key, stamp, x, y, z)
+    implicit none
+    class(FieldReader2Decomp), intent(inout) :: reader
+    integer,          intent(in) :: nx, ny, budget_source
+    character(len=2), intent(in) :: rc, rcbase
+    character(*),     intent(in) :: path, outdir, key, stamp
+    real(rk),         intent(in) :: x(:), y(:), z(:)
 
-      if(abl_type == 0)then
-        if(budget_source == 1)then
-          ! u'w'
-          buffer = eval_field('R13', reader, 1, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-          uw = uw + buffer
+    integer :: nxloc, nyloc, nzloc, ierr
+    real(rk), allocatable :: uw(:,:,:), vw(:,:,:), buffer(:,:,:)
+    real(rk), allocatable :: ytmp(:,:,:), ztmp(:,:,:)
+    real(rk), allocatable :: zcross(:,:), zcross_global(:,:)
+    character(len=256)    :: fname
 
-          buffer = eval_field('tau13', reader, 1, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-          uw = uw + buffer
+    call reader%local_shape(nxloc, nyloc, nzloc)
+    allocate(uw    (nxloc, nyloc, nzloc), source=0.0_rk)
+    allocate(vw    (nxloc, nyloc, nzloc), source=0.0_rk)
+    allocate(buffer(nxloc, nyloc, nzloc))
+    allocate(zcross       (nx, ny),       source=0.0_rk)
+    allocate(zcross_global(nx, ny),       source=0.0_rk)
+    allocate(ytmp(reader%gpC%ysz(1), reader%gpC%ysz(2), reader%gpC%ysz(3)))
+    allocate(ztmp(reader%gpC%zsz(1), reader%gpC%zsz(2), reader%gpC%zsz(3)))
 
-          ! v'w'
-          buffer = eval_field('R23', reader, 1, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-          vw = vw + buffer
+    if (budget_source == 1) then
+      ! u'w': resolved + SGS
+      uw = uw + eval_field('R13',   reader, 1, trim(path), rc, rc, trim(key), trim(stamp))
+      uw = uw + eval_field('tau13', reader, 1, trim(path), rc, rc, trim(key), trim(stamp))
+      ! v'w': resolved + SGS
+      vw = vw + eval_field('R23',   reader, 1, trim(path), rc, rc, trim(key), trim(stamp))
+      vw = vw + eval_field('tau23', reader, 1, trim(path), rc, rc, trim(key), trim(stamp))
+    else
+      ! u'w': base-state + linearised perturbation contributions
+      uw = uw + eval_field('R13',         reader, 1, trim(path), rcbase, rcbase, trim(key), trim(stamp))
+      uw = uw + eval_field('dup_dwp',     reader, 3, trim(path), rc,     rc,     trim(key), trim(stamp))
+      uw = uw + eval_field('dup_bwp',     reader, 3, trim(path), rc,     rc,     trim(key), trim(stamp))
+      uw = uw + eval_field('dwp_bup',     reader, 3, trim(path), rc,     rc,     trim(key), trim(stamp))
+      uw = uw + eval_field('tau13',       reader, 1, trim(path), rcbase, rcbase, trim(key), trim(stamp))
+      uw = uw + eval_field('delta_tau13', reader, 3, trim(path), rc,     rc,     trim(key), trim(stamp))
+      ! v'w': base-state + linearised perturbation contributions
+      vw = vw + eval_field('R23',         reader, 1, trim(path), rcbase, rcbase, trim(key), trim(stamp))
+      vw = vw + eval_field('dvp_dwp',     reader, 3, trim(path), rc,     rc,     trim(key), trim(stamp))
+      vw = vw + eval_field('dvp_bwp',     reader, 3, trim(path), rc,     rc,     trim(key), trim(stamp))
+      vw = vw + eval_field('dwp_bvp',     reader, 3, trim(path), rc,     rc,     trim(key), trim(stamp))
+      vw = vw + eval_field('tau23',       reader, 1, trim(path), rcbase, rcbase, trim(key), trim(stamp))
+      vw = vw + eval_field('delta_tau23', reader, 3, trim(path), rc,     rc,     trim(key), trim(stamp))
+    end if
 
-          buffer = eval_field('tau23', reader, 1, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-          vw = vw + buffer
+    ! Shear magnitude → transpose to z-pencil for column-wise search
+    buffer = sqrt(uw**2 + vw**2)
+    call transpose_x_to_y(buffer, ytmp, reader%gpC)
+    call transpose_y_to_z(ytmp,   ztmp, reader%gpC)
 
-        else
-          ! u'w'
-          buffer = eval_field('R13', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-          uw = uw + buffer
+    call find_threshold_crossing_z(ztmp, z, &
+        zcross(reader%gpC%zst(1) : reader%gpC%zst(1)+reader%gpC%zsz(1)-1, &
+               reader%gpC%zst(2) : reader%gpC%zst(2)+reader%gpC%zsz(2)-1),&
+        0.05_rk, 0.0_rk)
 
-          buffer = eval_field('dup_dwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-          uw = uw + buffer
+    call MPI_Reduce(zcross, zcross_global, nx*ny, MPI_DOUBLE_PRECISION, &
+                    MPI_SUM, 0, MPI_COMM_WORLD, ierr)
 
-          buffer = eval_field('dup_bwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-          uw = uw + buffer
+    if (myrank == 0) then
+      fname = trim(outdir)//'/Run'//trim(rc)//'_t'//trim(key)//'_SL_BLH.nc'
+      call message('Exporting to: '//trim(fname))
+      call export_slice_to_netcdf(trim(fname), 'BLH', zcross_global, x, y, 'x', 'y')
+    end if
+  end subroutine compute_abl_stress
 
-          buffer = eval_field('dwp_bup', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-          uw = uw + buffer
+  ! ─────────────────────────────────────────────────────────────────────────────
+  ! Inversion-based ABL height  (abl_type == 1)
+  !
+  ! Fits a Rampanelli-Zardi potential-temperature profile in every (x,y) column
+  ! and exports the inversion-base height h0 = l - ξ·d  and
+  !                  inversion-top  height h2 = l + ξ·d.
+  ! ─────────────────────────────────────────────────────────────────────────────
+  subroutine compute_abl_inversion(reader, nx, ny, nz, rc, rcbase, budget_source, &
+                                    path, outdir, key, stamp, x, y, z, lengthscale)
+    implicit none
+    class(FieldReader2Decomp), intent(inout) :: reader
+    integer,          intent(in) :: nx, ny, nz, budget_source
+    character(len=2), intent(in) :: rc, rcbase
+    character(*),     intent(in) :: path, outdir, key, stamp
+    real(rk),         intent(in) :: x(:), y(:), z(:), lengthscale
 
-          buffer = eval_field('tau13', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-          uw = uw + buffer
+    ! Rampanelli-Zardi fitting constants
+    real(rk), parameter :: l0  = 700.0_rk   ! initial guess: inversion centre (m)
+    real(rk), parameter :: d0  = 200.0_rk   ! initial guess: inversion half-width (m)
+    real(rk), parameter :: xi  = 1.3_rk     ! inversion-layer extent factor
 
-          buffer = eval_field('delta_tau13', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-          uw = uw + buffer
+    integer :: nxloc, nyloc, nzloc
+    integer :: ic, jc, ig, jg, ierr
+    real(rk), allocatable :: buffer(:,:,:), base(:,:,:)
+    real(rk), allocatable :: ytmp(:,:,:), ztmp(:,:,:)
+    real(rk), allocatable :: h0map(:,:), h2map(:,:), GMAP(:,:)
+    real(rk), allocatable :: tcol(:), z_in_m(:)
+    type(rz_params)        :: params
+    character(len=256)     :: fname
 
-          ! v'w'
-          buffer = eval_field('R23', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-          vw = vw + buffer
+    call reader%local_shape(nxloc, nyloc, nzloc)
+    allocate(buffer(nxloc, nyloc, nzloc))
+    allocate(ytmp  (reader%gpC%ysz(1), reader%gpC%ysz(2), reader%gpC%ysz(3)))
+    allocate(ztmp  (reader%gpC%zsz(1), reader%gpC%zsz(2), reader%gpC%zsz(3)))
+    allocate(h0map (nx, ny), source=0.0_rk)
+    allocate(h2map (nx, ny), source=0.0_rk)
+    allocate(GMAP  (nx, ny))
+    allocate(tcol  (nz))
+    allocate(z_in_m(nz))
 
-          buffer = eval_field('dvp_dwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-          vw = vw + buffer
+    z_in_m = z * lengthscale
 
-          buffer = eval_field('dvp_bwp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-          vw = vw + buffer
+    ! Assemble potential-temperature field
+    if (budget_source == 1) then
+      buffer = reader%read_field(trim(path)//'/Run'//trim(rc)// &
+              '_budget0_term26_t'//trim(key)//'_n'//trim(stamp)//'.s3D')
+    else
+      allocate(base(nxloc, nyloc, nzloc))
+      base   = reader%read_field(trim(path)//'/Run'//trim(rcbase)// &
+              '_budget0_term26_t'//trim(key)//'_n'//trim(stamp)//'.s3D')
+      buffer = reader%read_field(trim(path)//'/Run'//trim(rc)// &
+              '_comp_deficit_budget0_term05_t'//trim(key)//'_n'//trim(stamp)//'.s3D')
+      buffer = base + buffer   ! full field = base + deficit
+    end if
 
-          buffer = eval_field('dwp_bvp', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-          vw = vw + buffer
+    if (reader%gpC%zsz(3) /= nz) then
+      if (myrank == 0) call message('ERROR: z-pencil third dimension is not full nz.')
+      call MPI_Abort(MPI_COMM_WORLD, 222, ierr)
+    end if
 
-          buffer = eval_field('tau23', reader, 1, trim(path), trim(rcbase), trim(rcbase), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-          vw = vw + buffer
+    call transpose_x_to_y(buffer, ytmp, reader%gpC)
+    call transpose_y_to_z(ytmp,   ztmp, reader%gpC)
 
-          buffer = eval_field('delta_tau23', reader, 3, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
-          vw = vw + buffer
-        end if
+    ! Fit RZ profile column-by-column
+    do ic = 1, reader%gpC%zsz(1)
+      do jc = 1, reader%gpC%zsz(2)
+        ig   = reader%gpC%zst(1) + ic - 1
+        jg   = reader%gpC%zst(2) + jc - 1
+        tcol = ztmp(ic, jc, :)
 
-        ! Shear magnitude
-        buffer = sqrt(uw**2 + vw**2)
+        call fit_rz_profile(z_in_m, tcol, nz, l0, d0, params, &
+          d_min    = 1.0e-6_rk,  &
+          ridge    = 1.0e-12_rk, &
+          max_iter = 1000,        &
+          tol      = 1.0e-10_rk)
 
-        ! ABL height
-        call find_threshold_crossing_z(buffer, z, zcross(xs:xe, ys:ye), 0.05_rk, 0.0_rk)
-
-        ! MPI exchange
-        call MPI_Reduce(zcross, zcross_global, nx*ny, MPI_DOUBLE_PRECISION, &
-                  MPI_SUM, 0, MPI_COMM_WORLD, ierr)
-
-        if(myrank == 0)then
-          write(method, '(I1.1)')abl_type
-          fname = trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//'_SL_BLH_M'//method//'.nc' 
-          call message('Exporting to: '//trim(fname))
-          call export_slice_to_netcdf(trim(fname), 'BLH', zcross_global, x, y, 'x', 'y')
-        end if
-      
-      else if (abl_type == 1)then
-
-        ! Read temperature vertical gradient
-        ! if(budget_source == 1)then
-        !   buffer = reader%read_field(trim(path)//'/ddz_Run'//trim(rc)//'_budget0_term26_t'//trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D')
-        ! else
-        !   ! Base
-        !   uw = reader%read_field(trim(path)//'/ddz_Run'//trim(rcbase)//'_budget0_term26_t'//trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D')
-        !   buffer = buffer + uw
-
-        !   uw = reader%read_field(trim(path)//'/ddz_Run'//trim(rc)//'_comp_deficit_budget0_term05_t'//trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D')
-        !   buffer = buffer + uw
-        ! end if 
-
-        ! ! Now buffer holds d(theta)/dz
-        ! call find_capping_inversion(buffer, z, zcross(xs:xe, ys:ye), 0.15_rk)   
-
-        ! Read temperature
-        if(budget_source == 1)then
-          buffer = reader%read_field(trim(path)//'/Run'//trim(rc)//'_budget0_term26_t'//trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D')
-        else
-          ! Base
-          uw = reader%read_field(trim(path)//'/Run'//trim(rcbase)//'_budget0_term26_t'//trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D')
-          buffer = uw
-
-          uw = reader%read_field(trim(path)//'/Run'//trim(rc)//'_comp_deficit_budget0_term05_t'//trim(sorted_keys(k))//'_n'//trim(sorted_stamps(k))//'.s3D')
-          buffer = buffer + uw ! Full
-        end if 
-
-        block
-          real(rk), allocatable :: ytmp(:,:,:), ztmp(:,:,:)
-          real(rk), allocatable :: h0map(:,:), h2map(:,:), GMAP(:,:)
-          integer :: ic, jc, ig, jg
-          type(rz_params) :: params
-          real(rk) :: l0, d0, h0, h2
-          real(rk) :: xi
-          real(rk), allocatable :: tcol(:), z_in_m(:)
-          
-          allocate(ytmp(reader%gpC%ysz(1), reader%gpC%ysz(2), reader%gpC%ysz(3)))
-          allocate(ztmp(reader%gpC%zsz(1), reader%gpC%zsz(2), reader%gpC%zsz(3)))
-          allocate(h0map(nx, ny))
-          allocate(h2map(nx, ny))
-          allocate(GMAP(nx, ny))
-          allocate(tcol(nz))
-          allocate(z_in_m(nz))
-
-          z_in_m = z * lengthscale
-
-          call transpose_x_to_y(buffer, ytmp, reader%gpC)
-          call transpose_y_to_z(ytmp, ztmp, reader%gpC)
-
-          if (reader%gpC%zsz(3) /= nz) then
-              if (myrank == 0) call message('ERROR: z-pencil third dimension is not full nz.')
-              call MPI_Abort(MPI_COMM_WORLD, 222, ierr)
-          end if
-
-          l0 = 700.0_rk
-          d0 = 200.0_rk
-          xi = 1.3_rk
-
-          h0map = 0.0_rk
-          h2map = 0.0_rk
-
-          do ic = 1, reader%gpC%zsz(1)
-            do jc = 1, reader%gpC%zsz(2)
-              ig = reader%gpC%zst(1) + ic - 1
-              jg = reader%gpC%zst(2) + jc - 1
-              tcol = ztmp(ic,jc,:)
-
-              call fit_rz_profile( &
-                  z_in_m, tcol, nz, l0, d0, params, &
-                  d_min   = 1.0e-6_rk, &
-                  ridge   = 1.0e-12_rk, &
-                  max_iter = 1000, &
-                  tol     = 1.0e-10_rk &
-              )
-              
-              if (params%status == 0) then
-                  h0 = params%l - xi * params%d
-                  h2 = params%l + xi * params%d
-              else
-                  h0 = 0.0_rk
-                  h2 = 0.0_rk
-              end if
-
-              h0map(ig,jg) = h0
-              h2map(ig,jg) = h2
-            end do
-          end do
-
-          ! Write h0
-          GMAP = 0.0_rk
-          ! MPI exchange
-          call MPI_Reduce(h0map, GMAP, nx*ny, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
-          if(myrank == 0)then
-            fname = trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//'_INVH0.nc' 
-            call message('Exporting to: '//trim(fname))
-            call export_slice_to_netcdf(trim(fname), 'INVH0', GMAP, x, y, 'x', 'y')
-          end if
-
-          ! Write h2
-          GMAP = 0.0_rk
-          ! MPI exchange
-          call MPI_Reduce(h2map, GMAP, nx*ny, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
-          if(myrank == 0)then
-            fname = trim(outdir)//'/'//'Run'//trim(rc)//'_t'//trim(sorted_keys(k))//'_INVH2.nc' 
-            call message('Exporting to: '//trim(fname))
-            call export_slice_to_netcdf(trim(fname), 'INVH2', GMAP, x, y, 'x', 'y')
-          end if
-          deallocate(ytmp, ztmp, h0map, h2map, GMAP, z_in_m, tcol)
-        end block    
-      end if 
+        if (params%status == 0) then
+          h0map(ig,jg) = params%l - xi * params%d
+          h2map(ig,jg) = params%l + xi * params%d
+        end if   ! failed fits leave h = 0 (arrays are zero-initialised)
+      end do
     end do
 
-    if (allocated(uw)) deallocate(uw)
-    if (allocated(vw)) deallocate(vw)
-    if (allocated(buffer)) deallocate(buffer)
-    if (allocated(zcross)) deallocate(zcross)
-    if (allocated(zcross_global)) deallocate(zcross_global)
-    if (allocated(x)) deallocate(x)
-    if (allocated(y)) deallocate(y)
-    if (allocated(z)) deallocate(z)
-    if (allocated(sorted_keys)) deallocate(sorted_keys)
-    if (allocated(sorted_stamps)) deallocate(sorted_stamps)
-  end subroutine
+    ! Collect and write inversion-base height (h0)
+    GMAP = 0.0_rk
+    call MPI_Reduce(h0map, GMAP, nx*ny, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
+    if (myrank == 0) then
+      fname = trim(outdir)//'/Run'//trim(rc)//'_t'//trim(key)//'_INVH0.nc'
+      call message('Exporting to: '//trim(fname))
+      call export_slice_to_netcdf(trim(fname), 'INVH0', GMAP, x, y, 'x', 'y')
+    end if
+
+    ! Collect and write inversion-top height (h2)
+    GMAP = 0.0_rk
+    call MPI_Reduce(h2map, GMAP, nx*ny, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
+    if (myrank == 0) then
+      fname = trim(outdir)//'/Run'//trim(rc)//'_t'//trim(key)//'_INVH2.nc'
+      call message('Exporting to: '//trim(fname))
+      call export_slice_to_netcdf(trim(fname), 'INVH2', GMAP, x, y, 'x', 'y')
+    end if
+  end subroutine compute_abl_inversion
 
   subroutine find_capping_inversion(field, z, zcross, alpha)
     ! This suborutine should be used with a single process
