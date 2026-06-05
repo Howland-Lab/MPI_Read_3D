@@ -4,6 +4,9 @@
 module purge
 module load PrgEnv-gnu
 module load craype-x86-rome  
+module load cray-hdf5
+module load cray-netcdf
+module list
 
 # --- Compilers (use Cray wrappers) ---
 export COMPILER_ID=GNU
@@ -18,4 +21,8 @@ export source="mpi_diag.F90"
 export prog="MPIR3D"
 
 # GNU + OpenMPI
-mpif90 -O3 -fbacktrace -g -Wall -fopenmp -I${DECOMP2D_INC} ${source} -L${DECOMP2D_LIB} -l2decomp_fft -o ${prog}
+ftn -O3 -fbacktrace -g -Wall -fopenmp -ffree-line-length-none -fallow-argument-mismatch \
+  -I${DECOMP2D_INC} ${source} \
+  -L${DECOMP2D_LIB} -l2decomp_fft \
+  $(nf-config --fflags) $(nf-config --flibs) \
+  -o ${prog}
