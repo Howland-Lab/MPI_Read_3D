@@ -815,12 +815,20 @@ contains
     character(len=256):: f_
     integer :: k, nx, ny, nz, xs, xe, ys, ye, zs, ze, nxloc, nyloc, nzloc
     character(len=1024) :: filename_, outname
-    logical :: break=.false.
+    logical :: break=.false., filemode=.false.
 
     if(present(filename)) then
       filename_ = trim(filename)
     else
       filename_ = 'null'
+    end if
+
+    if(trim(filename_) /= 'null') then
+      call message('File mode is on')
+      filemode = .true.
+    else
+      call message('File mode is off')
+      filemode = .false.
     end if
 
     ! Fetch local and global sizes & start indices
@@ -847,7 +855,7 @@ contains
 
       if(break) exit  ! If we read from file, no need to loop over time snapshots
 
-      if(trim(filename_) == 'null')then
+      if(.not. filemode)then
         f1 = eval_field(trim(field), reader, budget_source, trim(path), trim(rc), trim(rc), trim(sorted_keys(k)), trim(sorted_stamps(k)))
       else
         f1 = reader%read_field(trim(path)//'/'//trim(filename_))
