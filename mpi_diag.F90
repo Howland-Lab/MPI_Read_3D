@@ -477,15 +477,15 @@ contains
        call parse_real_list(line, packets(ip)%coords, ios)
        if (ios /= 0) call fail(unit, ios, ierr, "Invalid coordinate list.")
 
-       ! Fourth line in packet: integration flag
+       ! Fourth line in packet: integration order. 0 disables integration.
        call read_nonempty_line(unit, line, ios)
-       if (ios /= 0) call fail(unit, ios, ierr, "Could not read integration flag.")
+       if (ios /= 0) call fail(unit, ios, ierr, "Could not read integration order.")
 
        read(line, *, iostat=ios) packets(ip)%integrate
-       if (ios /= 0) call fail(unit, ios, ierr, "Invalid integration flag.")
+       if (ios /= 0) call fail(unit, ios, ierr, "Invalid integration order.")
 
-       if (.not. any(packets(ip)%integrate == [0, 1])) then
-          call fail(unit, -2, ierr, "Integration flag must be 0 or 1.")
+       if (packets(ip)%integrate < 0) then
+          call fail(unit, -2, ierr, "Integration order must be non-negative.")
        end if
 
     end do
@@ -1085,11 +1085,12 @@ contains
     character(len=2) :: rc
     character(len=256) :: f_, field
     character(len=1) :: ax, x1name, x2name, eax
+    character(len=16) :: order_ch
     character(len=256) :: fname, msg
 
     ! Time keys
     character(len=:), allocatable :: sorted_keys(:), sorted_stamps(:)
-    integer :: num_stamps
+    integer :: num_stamps, order
 
     ! Slice arrays (global shape on every rank)
     real(rk), allocatable :: local_slice0(:,:), local_slice1(:,:)
@@ -1189,7 +1190,7 @@ contains
 
         slicepackets_loop: do islice = 1, size(slice_packets)
           ax = slice_packets(islice)%axis
-          integrate = (slice_packets(islice)%integrate == 1)
+          integrate = (slice_packets(islice)%integrate > 0)
           nslice = size(slice_packets(islice)%coords)
 
           if (myrank == 0) then
@@ -1248,6 +1249,7 @@ contains
             ! Wipe clean slice arrays
             local_slice0 = 0.0_rk
             global_slice0 = 0.0_rk
+            order = slice_packets(islice)%integrate
 
             ! Loop over the axis we integrate along
             ! j is global index
@@ -1261,14 +1263,16 @@ contains
               case('z')
                 slice_ptr => f1(:,:,jloc)
               end select
-              local_slice0(x1s:x1e, x2s:x2e) = local_slice0(x1s:x1e, x2s:x2e) + slice_ptr(:,:)*delta
+              local_slice0(x1s:x1e, x2s:x2e) = local_slice0(x1s:x1e, x2s:x2e) + slice_ptr(:,:)**order * delta
             end do
 
-            ! 3) Sum contributions from all ranks to get full global slices
+            ! 3) Sum power contributions from all ranks before taking the root.
             call MPI_Reduce(local_slice0, global_slice0, nx1*nx2, MPI_DOUBLE_PRECISION, &
               MPI_SUM, 0, MPI_COMM_WORLD, ierr)
 
             if (myrank == 0) then
+              global_slice0 = global_slice0**(1.0_rk/real(order, rk))
+
               ! Output file name
               if(.not. filemode) then
                 if(has_s3d_extension(trim(field))) then
@@ -1281,8 +1285,9 @@ contains
               else
                 fname = trim(outdir)//'/'//trim(strip_extension(trim(filename)))    
               end if
-              fname = trim(fname)//'_integ_'//trim(ax)//'.nc'
-              
+              write(order_ch,'(I0)') order
+              fname = trim(fname)//'_integ_'//trim(ax)//'_'//trim(order_ch)//'.nc'
+
               call message("Exporting to: "//trim(fname))
               call export_slice_to_netcdf(trim(fname), trim(field), global_slice0, x1, x2, x1name, x2name)
             end if
