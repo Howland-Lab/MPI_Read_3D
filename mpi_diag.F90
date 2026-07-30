@@ -57,6 +57,11 @@ module MPIR3D
      integer :: integrate = 0
   end type slice_packet_t
 
+  type :: rms_packet_t
+     character(len=1024) :: filename = ''
+     character(len=1) :: axis = ' '
+  end type rms_packet_t
+
   type :: rz_params
     real(rk) :: tm
     real(rk) :: a
@@ -986,6 +991,125 @@ contains
     if (allocated(f2)) deallocate(f2)
   end subroutine max_time_change
 
+  subroutine rms_profile_driver(reader, Lx, Ly, Lz, path, outdir, rms_map)
+    implicit none
+    class(FieldReader2Decomp), intent(inout) :: reader
+    real(rk), intent(in) :: Lx, Ly, Lz
+    character(*), intent(in) :: path, outdir, rms_map
+
+    type(rms_packet_t), allocatable :: packets(:)
+    real(rk), allocatable, target :: f(:,:,:)
+    real(rk), allocatable, target :: x(:), y(:), z(:)
+    real(rk), allocatable :: local_sum(:), global_sum(:), rms(:)
+    real(rk), pointer :: coord(:)
+    character(len=:), allocatable :: infile
+    character(len=:), allocatable :: leaf
+    character(len=:), allocatable :: stem
+    character(len=2048) :: outname
+    character(len=2048) :: msg
+    character(len=1) :: ax
+    integer :: nx, ny, nz
+    integer :: nxloc, nyloc, nzloc
+    integer :: xs, xe, ys, ye, zs, ze
+    integer :: ierr
+    integer :: ip, i, j, k
+    integer :: ni, kglob
+    real(rk) :: dx, dy, dz, area_weight
+
+    call read_rms_map(trim(rms_map), packets, ierr)
+    if (ierr /= 0) then
+      if (myrank == 0) then
+        write(msg,'(A,I0)') 'Error reading RMS map. ierr = ', ierr
+        call message(trim(msg))
+      end if
+      call MPI_ABORT(MPI_COMM_WORLD, 5125, ierr)
+    end if
+
+    call reader%local_shape(nxloc, nyloc, nzloc)
+    call reader%global_shape(nx, ny, nz)
+    call reader%indices(xs, xe, ys, ye, zs, ze)
+
+    dx = Lx/real(nx,rk)
+    dy = Ly/real(ny,rk)
+    dz = Lz/real(nz,rk)
+
+    allocate(f(nxloc, nyloc, nzloc))
+    allocate(x(nx), y(ny), z(nz))
+    call create_grid(Lx, Ly, Lz, nx, ny, nz, x, y, z)
+
+    do ip = 1, size(packets)
+      ax = packets(ip)%axis
+      infile = resolve_input_path(trim(path), trim(packets(ip)%filename))
+
+      if (myrank == 0) then
+        write(msg,'(A,I0,A,I0,A,A,A,A)') 'Processing RMS map row ', ip, '/', size(packets), &
+          ': ', trim(packets(ip)%filename), ' along ', ax
+        call message(trim(msg))
+      end if
+
+      f = reader%read_field(trim(infile))
+
+      select case (ax)
+      case ('x')
+        ni = nx
+        coord => x
+        area_weight = dy * dz
+      case ('y')
+        ni = ny
+        coord => y
+        area_weight = dx * dz
+      case ('z')
+        ni = nz
+        coord => z
+        area_weight = dx * dy
+      end select
+
+      if (allocated(local_sum)) deallocate(local_sum)
+      if (allocated(global_sum)) deallocate(global_sum)
+      if (allocated(rms)) deallocate(rms)
+      allocate(local_sum(ni), source=0.0_rk)
+      allocate(global_sum(ni), source=0.0_rk)
+      allocate(rms(ni), source=0.0_rk)
+
+      select case (ax)
+      case ('x')
+        do i = 1, nxloc
+          kglob = xs + i - 1
+          local_sum(kglob) = sum(f(i,:,:)**2) * area_weight
+        end do
+      case ('y')
+        do j = 1, nyloc
+          kglob = ys + j - 1
+          local_sum(kglob) = sum(f(:,j,:)**2) * area_weight
+        end do
+      case ('z')
+        do k = 1, nzloc
+          kglob = zs + k - 1
+          local_sum(kglob) = sum(f(:,:,k)**2) * area_weight
+        end do
+      end select
+
+      call MPI_Allreduce(local_sum, global_sum, ni, MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
+      rms = sqrt(global_sum)
+
+      if (myrank == 0) then
+        leaf = basename_only(trim(packets(ip)%filename))
+        stem = strip_extension(trim(leaf))
+        outname = trim(outdir)//'/'//trim(stem)//'_rms_'//ax//'.csv'
+        call message('Exporting to: '//trim(outname))
+        call csv_rms_profile(ni, trim(outname), ax, coord, rms)
+      end if
+    end do
+
+    if (allocated(f)) deallocate(f)
+    if (allocated(x)) deallocate(x)
+    if (allocated(y)) deallocate(y)
+    if (allocated(z)) deallocate(z)
+    if (allocated(local_sum)) deallocate(local_sum)
+    if (allocated(global_sum)) deallocate(global_sum)
+    if (allocated(rms)) deallocate(rms)
+  end subroutine rms_profile_driver
+
   subroutine read_field_list(filename, field_list, ierr)
     implicit none
 
@@ -1049,6 +1173,162 @@ contains
     close(unit)
 
   end subroutine read_field_list
+
+  subroutine read_rms_map(filename, packets, ierr)
+    implicit none
+
+    character(len=*), intent(in) :: filename
+    type(rms_packet_t), allocatable, intent(out) :: packets(:)
+    integer, intent(out), optional :: ierr
+
+    integer :: unit
+    integer :: ios
+    integer :: nitems
+    integer :: i
+    integer :: comma_pos
+    character(len=2048) :: line
+    character(len=1024) :: name_part
+    character(len=1024) :: axis_part
+    character(len=1) :: ax
+
+    if (present(ierr)) ierr = 0
+
+    open(newunit=unit, file=filename, status='old', action='read', iostat=ios)
+    if (ios /= 0) then
+      if (present(ierr)) then
+        ierr = ios
+        return
+      else
+        error stop "Could not open RMS-map file."
+      end if
+    end if
+
+    nitems = 0
+    do
+      call read_nonempty_line(unit, line, ios)
+      if (ios /= 0) exit
+
+      comma_pos = index(line, ',')
+      if (comma_pos <= 1) then
+        close(unit)
+        if (present(ierr)) then
+          ierr = -1
+          return
+        else
+          error stop "Malformed RMS-map line."
+        end if
+      end if
+      nitems = nitems + 1
+    end do
+
+    if (ios > 0) then
+      close(unit)
+      if (present(ierr)) then
+        ierr = ios
+        return
+      else
+        error stop "Error while reading RMS-map file."
+      end if
+    end if
+
+    allocate(packets(nitems))
+    rewind(unit)
+
+    i = 0
+    do
+      call read_nonempty_line(unit, line, ios)
+      if (ios /= 0) exit
+
+      comma_pos = index(line, ',')
+      if (comma_pos <= 1) then
+        close(unit)
+        if (present(ierr)) then
+          ierr = -2
+          return
+        else
+          error stop "Malformed RMS-map line."
+        end if
+      end if
+
+      name_part = adjustl(line(:comma_pos-1))
+      axis_part = adjustl(line(comma_pos+1:))
+      ax = to_lower(parse_axis(axis_part))
+
+      if (len_trim(name_part) == 0) then
+        close(unit)
+        if (present(ierr)) then
+          ierr = -3
+          return
+        else
+          error stop "Missing RMS-map filename."
+        end if
+      end if
+
+      if (.not. any(ax == ['x', 'y', 'z'])) then
+        close(unit)
+        if (present(ierr)) then
+          ierr = -4
+          return
+        else
+          error stop "Invalid RMS-map axis."
+        end if
+      end if
+
+      i = i + 1
+      packets(i)%filename = trim(name_part)
+      packets(i)%axis = ax
+    end do
+
+    close(unit)
+
+  end subroutine read_rms_map
+
+  logical function is_absolute_path(filename)
+    implicit none
+    character(len=*), intent(in) :: filename
+
+    is_absolute_path = len_trim(filename) > 0
+    if (is_absolute_path) is_absolute_path = filename(1:1) == '/'
+  end function is_absolute_path
+
+  function resolve_input_path(path, filename) result(fullpath)
+    implicit none
+    character(len=*), intent(in) :: path, filename
+    character(len=:), allocatable :: fullpath
+
+    if (is_absolute_path(trim(filename))) then
+      fullpath = trim(filename)
+    else
+      fullpath = trim(path)//'/'//trim(filename)
+    end if
+  end function resolve_input_path
+
+  function basename_only(filename) result(basename)
+    implicit none
+    character(len=*), intent(in) :: filename
+    character(len=:), allocatable :: basename
+    integer :: i
+    integer :: last_slash
+    integer :: n
+
+    n = len_trim(filename)
+    last_slash = 0
+
+    do i = n, 1, -1
+      if (filename(i:i) == '/') then
+        last_slash = i
+        exit
+      end if
+    end do
+
+    if (last_slash == 0) then
+      basename = filename(1:n)
+    else if (last_slash < n) then
+      basename = filename(last_slash+1:n)
+    else
+      basename = ''
+    end if
+  end function basename_only
 
   logical function has_s3d_extension(filename)
     implicit none
@@ -3366,6 +3646,27 @@ contains
     close(uo)
   end subroutine csvprofile
 
+  subroutine csv_rms_profile(n, filename, axis, coord, rms)
+    integer, intent(in) :: n
+    character(*), intent(in) :: filename
+    character(1), intent(in) :: axis
+    real(rk), intent(in) :: coord(n)
+    real(rk), intent(in) :: rms(n)
+    integer :: uo, k, ierr
+
+    if (size(coord) /= n .or. size(rms) /= n) then
+      if(myrank == 0) call message('ERROR(CSV): coordinate and RMS size mismatch.')
+      call MPI_Abort(MPI_COMM_WORLD, 101, ierr)
+    end if
+
+    open(newunit=uo, file=trim(filename), status='replace', action='write')
+    write(uo,'(A)') axis//',RMS'
+    do k = 1, n
+      write(uo,'(ES23.15, ",", ES23.15)') coord(k), rms(k)
+    end do
+    close(uo)
+  end subroutine csv_rms_profile
+
   !---------------------------------------------------------------------------
   ! Write a 2D slice f(x1,x2) as CSV:
   !   - nx1 rows (i = 1..nx1)
@@ -4052,7 +4353,7 @@ program MPIR3D_
   type(FieldReader2Decomp) :: reader
   integer :: ierr
   character(len=256) :: path, outdir
-  character(len=256) :: field, slice_map
+  character(len=256) :: field, slice_map = 'null', rms_map = 'null'
   integer :: nx=1, ny=1, nz=1, runid=1, taskid=0, abl_type=0
   real(rk) :: Lx=1.0_rk, Ly=1.0_rk, Lz=1.0_rk
   real(rk) :: x1=-1._rk, x2=-1._rk, y1=-1._rk, y2=-1._rk, z1=-1._rk, z2=-1._rk
@@ -4063,7 +4364,7 @@ program MPIR3D_
   character(len=256) :: filename = 'null'
   integer :: start_idx=0, end_idx=huge(1)
   namelist /SETUP/ nx, ny, nz, Lx, Ly, Lz, path, outdir, runid, taskid, field, &
-                   slice_map, budget_source, filename, &
+                   slice_map, rms_map, budget_source, filename, &
                    start_idx, end_idx, abl_type, lengthscale
   namelist /BOX/ x1, x2, y1, y2, z1, z2
       
@@ -4118,6 +4419,9 @@ program MPIR3D_
   else if (taskid == 4)then
     call max_time_change(reader, runid, trim(path), trim(field), &
       budget_source, start_idx, end_idx)
+  else if (taskid == 5)then
+    if (trim(rms_map) == 'null') rms_map = trim(slice_map)
+    call rms_profile_driver(reader, Lx, Ly, Lz, trim(path), trim(outdir), trim(rms_map))
   end if
   
   if(myrank == 0) call message('Wrapping up ...')
