@@ -59,7 +59,15 @@ module MPIR3D
 
   type :: rms_packet_t
      character(len=1024) :: filename = ''
+     integer :: nfiles = 0
+     character(len=1024), allocatable :: filenames(:)
+     real(rk), allocatable :: coeffs(:)
+     character(len=2048) :: output_stem = ''
      character(len=1) :: axis = ' '
+     real(rk) :: bounds_min(3) = [-huge(1.0_rk), -huge(1.0_rk), -huge(1.0_rk)]
+     real(rk) :: bounds_max(3) = [ huge(1.0_rk),  huge(1.0_rk),  huge(1.0_rk)]
+     logical :: has_min(3) = [.false., .false., .false.]
+     logical :: has_max(3) = [.false., .false., .false.]
   end type rms_packet_t
 
   type :: rz_params
@@ -1003,8 +1011,6 @@ contains
     real(rk), allocatable :: local_sum(:), global_sum(:), rms(:)
     real(rk), pointer :: coord(:)
     character(len=:), allocatable :: infile
-    character(len=:), allocatable :: leaf
-    character(len=:), allocatable :: stem
     character(len=2048) :: outname
     character(len=2048) :: msg
     character(len=1) :: ax
@@ -1013,7 +1019,8 @@ contains
     integer :: xs, xe, ys, ye, zs, ze
     integer :: ierr
     integer :: ip, i, j, k
-    integer :: ni, kglob
+    integer :: ifile
+    integer :: ni, iglob, jglob, kglob, profile_axis_index
     real(rk) :: dx, dy, dz, area_weight
 
     call read_rms_map(trim(rms_map), packets, ierr)
@@ -1039,29 +1046,35 @@ contains
 
     do ip = 1, size(packets)
       ax = packets(ip)%axis
-      infile = resolve_input_path(trim(path), trim(packets(ip)%filename))
 
       if (myrank == 0) then
-        write(msg,'(A,I0,A,I0,A,A,A,A)') 'Processing RMS map row ', ip, '/', size(packets), &
-          ': ', trim(packets(ip)%filename), ' along ', ax
+        write(msg,'(A,I0,A,I0,A,A,A,I0,A,A)') 'Processing RMS map row ', ip, '/', size(packets), &
+          ': ', trim(packets(ip)%filename), ' (', packets(ip)%nfiles, ' file(s)) along ', ax
         call message(trim(msg))
       end if
 
-      f = reader%read_field(trim(infile))
+      f = 0.0_rk
+      do ifile = 1, packets(ip)%nfiles
+        infile = resolve_input_path(trim(path), trim(packets(ip)%filenames(ifile)))
+        f = f + packets(ip)%coeffs(ifile) * reader%read_field(trim(infile))
+      end do
 
       select case (ax)
       case ('x')
         ni = nx
         coord => x
         area_weight = dy * dz
+        profile_axis_index = 1
       case ('y')
         ni = ny
         coord => y
         area_weight = dx * dz
+        profile_axis_index = 2
       case ('z')
         ni = nz
         coord => z
         area_weight = dx * dy
+        profile_axis_index = 3
       end select
 
       if (allocated(local_sum)) deallocate(local_sum)
@@ -1074,18 +1087,45 @@ contains
       select case (ax)
       case ('x')
         do i = 1, nxloc
-          kglob = xs + i - 1
-          local_sum(kglob) = sum(f(i,:,:)**2) * area_weight
+          iglob = xs + i - 1
+          if (.not. rms_coord_in_bounds(x(iglob), packets(ip), 1)) cycle
+          do j = 1, nyloc
+            jglob = ys + j - 1
+            if (.not. rms_coord_in_bounds(y(jglob), packets(ip), 2)) cycle
+            do k = 1, nzloc
+              kglob = zs + k - 1
+              if (.not. rms_coord_in_bounds(z(kglob), packets(ip), 3)) cycle
+              local_sum(iglob) = local_sum(iglob) + f(i,j,k)**2 * area_weight
+            end do
+          end do
         end do
       case ('y')
         do j = 1, nyloc
-          kglob = ys + j - 1
-          local_sum(kglob) = sum(f(:,j,:)**2) * area_weight
+          jglob = ys + j - 1
+          if (.not. rms_coord_in_bounds(y(jglob), packets(ip), 2)) cycle
+          do i = 1, nxloc
+            iglob = xs + i - 1
+            if (.not. rms_coord_in_bounds(x(iglob), packets(ip), 1)) cycle
+            do k = 1, nzloc
+              kglob = zs + k - 1
+              if (.not. rms_coord_in_bounds(z(kglob), packets(ip), 3)) cycle
+              local_sum(jglob) = local_sum(jglob) + f(i,j,k)**2 * area_weight
+            end do
+          end do
         end do
       case ('z')
         do k = 1, nzloc
           kglob = zs + k - 1
-          local_sum(kglob) = sum(f(:,:,k)**2) * area_weight
+          if (.not. rms_coord_in_bounds(z(kglob), packets(ip), 3)) cycle
+          do i = 1, nxloc
+            iglob = xs + i - 1
+            if (.not. rms_coord_in_bounds(x(iglob), packets(ip), 1)) cycle
+            do j = 1, nyloc
+              jglob = ys + j - 1
+              if (.not. rms_coord_in_bounds(y(jglob), packets(ip), 2)) cycle
+              local_sum(kglob) = local_sum(kglob) + f(i,j,k)**2 * area_weight
+            end do
+          end do
         end do
       end select
 
@@ -1093,11 +1133,10 @@ contains
       rms = sqrt(global_sum)
 
       if (myrank == 0) then
-        leaf = basename_only(trim(packets(ip)%filename))
-        stem = strip_extension(trim(leaf))
-        outname = trim(outdir)//'/'//trim(stem)//'_rms_'//ax//'.csv'
+        outname = trim(outdir)//'/'//trim(packets(ip)%output_stem)//'_rms_'//ax//&
+          trim(rms_bounds_suffix(packets(ip)))//'.csv'
         call message('Exporting to: '//trim(outname))
-        call csv_rms_profile(ni, trim(outname), ax, coord, rms)
+        call csv_rms_profile_bounded(ni, trim(outname), ax, coord, rms, packets(ip), profile_axis_index)
       end if
     end do
 
@@ -1186,10 +1225,13 @@ contains
     integer :: nitems
     integer :: i
     integer :: comma_pos
+    integer :: second_comma_pos
     character(len=2048) :: line
     character(len=1024) :: name_part
     character(len=1024) :: axis_part
+    character(len=1024) :: bounds_part
     character(len=1) :: ax
+    real(rk) :: bounds_values(6)
 
     if (present(ierr)) ierr = 0
 
@@ -1275,13 +1317,248 @@ contains
       end if
 
       i = i + 1
-      packets(i)%filename = trim(name_part)
+      call parse_rms_file_expr(trim(name_part), packets(i), ios)
+      if (ios /= 0) then
+        close(unit)
+        if (present(ierr)) then
+          ierr = -7
+          return
+        else
+          error stop "Invalid RMS-map file expression."
+        end if
+      end if
       packets(i)%axis = ax
+
+      second_comma_pos = index(line(comma_pos+1:), ',')
+      if (second_comma_pos > 0) then
+        bounds_part = adjustl(line(comma_pos + second_comma_pos + 1:))
+        call parse_real_list(bounds_part, bounds_values, ios)
+        if (ios /= 0) then
+          close(unit)
+          if (present(ierr)) then
+            ierr = -5
+            return
+          else
+            error stop "Invalid RMS-map bounds."
+          end if
+        end if
+
+        call set_rms_bounds(packets(i), bounds_values, ios)
+        if (ios /= 0) then
+          close(unit)
+          if (present(ierr)) then
+            ierr = -6
+            return
+          else
+            error stop "Invalid RMS-map bound ordering."
+          end if
+        end if
+      end if
     end do
 
     close(unit)
 
   end subroutine read_rms_map
+
+  subroutine parse_rms_file_expr(expr, packet, ios)
+    implicit none
+
+    character(len=*), intent(in) :: expr
+    type(rms_packet_t), intent(inout) :: packet
+    integer, intent(out) :: ios
+
+    integer, parameter :: max_terms = 128
+    character(len=1024) :: tmp_files(max_terms)
+    real(rk) :: tmp_coeffs(max_terms)
+    character(len=1024) :: coeff_part
+    character(len=1024) :: file_part
+    integer :: pos, n, expr_len
+    integer :: close_pos
+    integer :: nterms
+
+    ios = 0
+    packet%filename = trim(expr)
+    packet%nfiles = 0
+    packet%output_stem = ''
+    if (allocated(packet%filenames)) deallocate(packet%filenames)
+    if (allocated(packet%coeffs)) deallocate(packet%coeffs)
+
+    expr_len = len_trim(expr)
+    if (expr_len == 0) then
+      ios = 1
+      return
+    end if
+
+    pos = 1
+    call skip_spaces(expr, pos, expr_len)
+
+    if (pos > expr_len .or. expr(pos:pos) /= '(') then
+      allocate(packet%filenames(1))
+      allocate(packet%coeffs(1))
+      packet%nfiles = 1
+      packet%filenames(1) = trim(expr)
+      packet%coeffs(1) = 1.0_rk
+      packet%output_stem = rms_output_stem(packet)
+      return
+    end if
+
+    nterms = 0
+    do
+      if (nterms >= max_terms) then
+        ios = 2
+        return
+      end if
+
+      call skip_spaces(expr, pos, expr_len)
+      if (pos > expr_len .or. expr(pos:pos) /= '(') then
+        ios = 3
+        return
+      end if
+      if (pos >= expr_len) then
+        ios = 4
+        return
+      end if
+
+      close_pos = index(expr(pos+1:expr_len), ')')
+      if (close_pos <= 0) then
+        ios = 4
+        return
+      end if
+      close_pos = pos + close_pos
+      coeff_part = adjustl(expr(pos+1:close_pos-1))
+      nterms = nterms + 1
+      read(coeff_part, *, iostat=ios) tmp_coeffs(nterms)
+      if (ios /= 0) return
+      pos = close_pos + 1
+
+      call skip_spaces(expr, pos, expr_len)
+      if (pos > expr_len .or. expr(pos:pos) /= '(') then
+        ios = 5
+        return
+      end if
+      if (pos >= expr_len) then
+        ios = 6
+        return
+      end if
+
+      close_pos = index(expr(pos+1:expr_len), ')')
+      if (close_pos <= 0) then
+        ios = 6
+        return
+      end if
+      close_pos = pos + close_pos
+      file_part = adjustl(expr(pos+1:close_pos-1))
+      if (len_trim(file_part) == 0) then
+        ios = 7
+        return
+      end if
+      tmp_files(nterms) = trim(file_part)
+      pos = close_pos + 1
+
+      call skip_spaces(expr, pos, expr_len)
+      if (pos > expr_len) exit
+      if (expr(pos:pos) /= '+') then
+        ios = 8
+        return
+      end if
+      pos = pos + 1
+    end do
+
+    allocate(packet%filenames(nterms))
+    allocate(packet%coeffs(nterms))
+    packet%nfiles = nterms
+    do n = 1, nterms
+      packet%filenames(n) = trim(tmp_files(n))
+      packet%coeffs(n) = tmp_coeffs(n)
+    end do
+    packet%output_stem = rms_output_stem(packet)
+  end subroutine parse_rms_file_expr
+
+  subroutine skip_spaces(str, pos, last)
+    implicit none
+
+    character(len=*), intent(in) :: str
+    integer, intent(inout) :: pos
+    integer, intent(in) :: last
+
+    do while (pos <= last)
+      if (str(pos:pos) /= ' ' .and. str(pos:pos) /= char(9)) exit
+      pos = pos + 1
+    end do
+  end subroutine skip_spaces
+
+  subroutine set_rms_bounds(packet, values, ios)
+    implicit none
+
+    type(rms_packet_t), intent(inout) :: packet
+    real(rk), intent(in) :: values(6)
+    integer, intent(out) :: ios
+
+    integer :: iax
+
+    ios = 0
+
+    packet%bounds_min = [-huge(1.0_rk), -huge(1.0_rk), -huge(1.0_rk)]
+    packet%bounds_max = [ huge(1.0_rk),  huge(1.0_rk),  huge(1.0_rk)]
+    packet%has_min = [.false., .false., .false.]
+    packet%has_max = [.false., .false., .false.]
+
+    do iax = 1, 3
+      if (values(2*iax-1) >= 0.0_rk) then
+        packet%bounds_min(iax) = values(2*iax-1)
+        packet%has_min(iax) = .true.
+      end if
+
+      if (values(2*iax) >= 0.0_rk) then
+        packet%bounds_max(iax) = values(2*iax)
+        packet%has_max(iax) = .true.
+      end if
+
+      if (packet%has_min(iax) .and. packet%has_max(iax)) then
+        if (packet%bounds_min(iax) > packet%bounds_max(iax)) then
+          ios = iax
+          return
+        end if
+      end if
+    end do
+  end subroutine set_rms_bounds
+
+  pure logical function rms_coord_in_bounds(coord, packet, axis_index)
+    implicit none
+
+    real(rk), intent(in) :: coord
+    type(rms_packet_t), intent(in) :: packet
+    integer, intent(in) :: axis_index
+
+    rms_coord_in_bounds = &
+      coord >= packet%bounds_min(axis_index) .and. &
+      coord <= packet%bounds_max(axis_index)
+  end function rms_coord_in_bounds
+
+  function rms_bounds_suffix(packet) result(suffix)
+    implicit none
+
+    type(rms_packet_t), intent(in) :: packet
+    character(len=256) :: suffix
+    character(len=1), parameter :: axis_name(3) = ['x', 'y', 'z']
+    integer :: iax
+
+    suffix = ''
+
+    do iax = 1, 3
+      if (packet%has_min(iax) .and. packet%has_max(iax)) then
+        suffix = trim(suffix)//'_'//axis_name(iax)//&
+          trim(real2string(packet%bounds_min(iax)))//'-'//&
+          trim(real2string(packet%bounds_max(iax)))
+      else if (packet%has_min(iax)) then
+        suffix = trim(suffix)//'_'//axis_name(iax)//'min'//&
+          trim(real2string(packet%bounds_min(iax)))
+      else if (packet%has_max(iax)) then
+        suffix = trim(suffix)//'_'//axis_name(iax)//'max'//&
+          trim(real2string(packet%bounds_max(iax)))
+      end if
+    end do
+  end function rms_bounds_suffix
 
   logical function is_absolute_path(filename)
     implicit none
@@ -1329,6 +1606,142 @@ contains
       basename = ''
     end if
   end function basename_only
+
+  function rms_output_stem(packet) result(outstem)
+    implicit none
+
+    type(rms_packet_t), intent(in) :: packet
+    character(len=:), allocatable :: outstem
+
+    character(len=:), allocatable :: leaf
+    character(len=:), allocatable :: stem
+    character(len=1024) :: prefix0, suffix0
+    character(len=128) :: budget0
+    character(len=2048) :: term_expr
+    character(len=2048) :: budget_term_expr
+    character(len=1024) :: prefix, suffix
+    character(len=128) :: budget, term
+    logical :: ok, all_ok, same_budget
+    integer :: i
+
+    if (packet%nfiles <= 1) then
+      leaf = basename_only(trim(packet%filenames(1)))
+      outstem = strip_extension(trim(leaf))
+      return
+    end if
+
+    term_expr = ''
+    budget_term_expr = ''
+    all_ok = .true.
+    same_budget = .true.
+
+    do i = 1, packet%nfiles
+      leaf = basename_only(trim(packet%filenames(i)))
+      stem = strip_extension(trim(leaf))
+      call parse_budget_term_stem(trim(stem), prefix, budget, term, suffix, ok)
+      if (.not. ok) then
+        all_ok = .false.
+        exit
+      end if
+
+      if (i == 1) then
+        prefix0 = trim(prefix)
+        budget0 = trim(budget)
+        suffix0 = trim(suffix)
+      else
+        if (trim(prefix) /= trim(prefix0) .or. trim(suffix) /= trim(suffix0)) then
+          all_ok = .false.
+          exit
+        end if
+        if (trim(budget) /= trim(budget0)) same_budget = .false.
+      end if
+
+      if (len_trim(term_expr) > 0) term_expr = trim(term_expr)//'+'
+      term_expr = trim(term_expr)//trim(term)
+
+      if (len_trim(budget_term_expr) > 0) budget_term_expr = trim(budget_term_expr)//'+'
+      budget_term_expr = trim(budget_term_expr)//trim(budget)//'_term'//trim(term)
+    end do
+
+    if (all_ok) then
+      if (same_budget) then
+        outstem = trim(prefix0)//'_budget'//trim(budget0)//'_term('//&
+          trim(term_expr)//')'//trim(suffix0)
+      else
+        outstem = trim(prefix0)//'_budget('//trim(budget_term_expr)//')'//trim(suffix0)
+      end if
+    else
+      outstem = rms_fallback_output_stem(packet)
+    end if
+  end function rms_output_stem
+
+  subroutine parse_budget_term_stem(stem, prefix, budget, term, suffix, ok)
+    implicit none
+
+    character(len=*), intent(in) :: stem
+    character(len=*), intent(out) :: prefix, budget, term, suffix
+    logical, intent(out) :: ok
+
+    integer :: budget_pos
+    integer :: term_rel, term_pos
+    integer :: digit_start, digit_end
+    integer :: n
+
+    prefix = ''
+    budget = ''
+    term = ''
+    suffix = ''
+    ok = .false.
+
+    n = len_trim(stem)
+    if (n <= 0) return
+    budget_pos = index(stem(:n), '_budget')
+    if (budget_pos <= 0) return
+    if (budget_pos + 7 > n) return
+
+    term_rel = index(stem(budget_pos+7:n), '_term')
+    if (term_rel <= 0) return
+    term_pos = budget_pos + 7 + term_rel - 1
+    if (term_pos <= budget_pos + 7) return
+
+    if (budget_pos > 1) prefix = stem(:budget_pos-1)
+    budget = stem(budget_pos+7:term_pos-1)
+    if (len_trim(budget) == 0) return
+
+    digit_start = term_pos + 5
+    if (digit_start > n) return
+    digit_end = digit_start
+    do while (digit_end <= n)
+      if (stem(digit_end:digit_end) < '0' .or. stem(digit_end:digit_end) > '9') exit
+      digit_end = digit_end + 1
+    end do
+    digit_end = digit_end - 1
+    if (digit_end < digit_start) return
+
+    term = stem(digit_start:digit_end)
+    if (digit_end < n) suffix = stem(digit_end+1:n)
+    ok = .true.
+  end subroutine parse_budget_term_stem
+
+  function rms_fallback_output_stem(packet) result(outstem)
+    implicit none
+
+    type(rms_packet_t), intent(in) :: packet
+    character(len=:), allocatable :: outstem
+
+    character(len=:), allocatable :: leaf
+    character(len=:), allocatable :: stem
+    integer :: i
+
+    outstem = 'sum('
+    do i = 1, packet%nfiles
+      leaf = basename_only(trim(packet%filenames(i)))
+      stem = strip_extension(trim(leaf))
+      if (i > 1) outstem = outstem//'+'
+      outstem = outstem//trim(stem)
+    end do
+    outstem = outstem//')'
+  end function rms_fallback_output_stem
 
   logical function has_s3d_extension(filename)
     implicit none
@@ -3666,6 +4079,30 @@ contains
     end do
     close(uo)
   end subroutine csv_rms_profile
+
+  subroutine csv_rms_profile_bounded(n, filename, axis, coord, rms, packet, axis_index)
+    integer, intent(in) :: n
+    character(*), intent(in) :: filename
+    character(1), intent(in) :: axis
+    real(rk), intent(in) :: coord(n)
+    real(rk), intent(in) :: rms(n)
+    type(rms_packet_t), intent(in) :: packet
+    integer, intent(in) :: axis_index
+    integer :: uo, k, ierr
+
+    if (size(coord) /= n .or. size(rms) /= n) then
+      if(myrank == 0) call message('ERROR(CSV): coordinate and RMS size mismatch.')
+      call MPI_Abort(MPI_COMM_WORLD, 101, ierr)
+    end if
+
+    open(newunit=uo, file=trim(filename), status='replace', action='write')
+    write(uo,'(A)') axis//',RMS'
+    do k = 1, n
+      if (.not. rms_coord_in_bounds(coord(k), packet, axis_index)) cycle
+      write(uo,'(ES23.15, ",", ES23.15)') coord(k), rms(k)
+    end do
+    close(uo)
+  end subroutine csv_rms_profile_bounded
 
   !---------------------------------------------------------------------------
   ! Write a 2D slice f(x1,x2) as CSV:
