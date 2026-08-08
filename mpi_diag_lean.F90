@@ -1883,17 +1883,19 @@ contains
     character(*), intent(in) :: path
     real(rk), intent(out) :: field(this%nxloc,this%nyloc,this%nzloc)
     integer :: ierr
+    character(len=str_len) :: read_path
     logical :: exists
+    read_path = trim(path)
     if (.not. this%is_init) then
       call message('ERROR: FieldReader2Decomp is not initialized before read_field().')
       call MPI_Abort(MPI_COMM_WORLD, 101, ierr)
     end if
-    inquire(file=trim(path), exist=exists)
+    inquire(file=trim(read_path), exist=exists)
     if (.not. exists) then
-      call message('ERROR: input field file does not exist: '//trim(path))
+      call message('ERROR: input field file does not exist: '//trim(read_path))
       call MPI_Abort(MPI_COMM_WORLD, 102, ierr)
     end if
-    call decomp_2d_read_one(1, field, trim(path), this%gpC)
+    call decomp_2d_read_one(1, field, read_path, this%gpC)
   end subroutine frd_read_field
 
   subroutine frd_global_shape(this, nx, ny, nz)
