@@ -1,0 +1,13 @@
+! Copy this file and edit path, outdir, grid, and diag_map.
+&SETUP
+  nx       = 1330
+  ny       = 466
+  nz       = 700
+  Lx       = 317.4603175D0
+  Ly       = 55.55555555555D0
+  Lz       = 55.55555555555D0
+  path     = "/path/to/padeops/output"
+  outdir   = "/path/to/diagnostic/output"
+  driver   = "rms"
+  diag_map = "examples/rms_map.diag"
+/

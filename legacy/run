@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+
+#SBATCH --nodes=1
+#SBATCH --partition=standard
+#SBATCH --qos=short
+#SBATCH --account=e773-PA-174
+#SBATCH --time=00:20:00
+#SBATCH -o output_.o%j                        # Name of stdout output file
+#SBATCH -e error_.e%j                         # Name of stderr error file
+
+# --- Modules ---
+module purge
+module load PrgEnv-gnu
+module load craype-x86-rome  
+
+NCPUS=10
+solver="/mnt/lustre/a2fs-work3/work/e773/e773/pounds/MPI_PadeOps_diags/MPIR3D"
+input="/mnt/lustre/a2fs-work3/work/e773/e773/pounds/MPI_PadeOps_diags/input.dat"
+srun -n ${NCPUS} ${solver} ${input}

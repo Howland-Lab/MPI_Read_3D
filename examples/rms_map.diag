@@ -1,0 +1,26 @@
+# RMS profile driver.
+# Each rms block has its own field expression, profile axis, and optional bounds.
+# Bounds are xmin,xmax,ymin,ymax,zmin,zmax.  Use * for an open side.
+# The exported profile is sqrt(integral f**2 dA), i.e. a cross-plane L2 norm.
+# Divide offline by the bounded cross-sectional area if RMS normalization is desired.
+
+driver = rms
+
+rms {
+  name = u_rms
+  expr {
+    (1.0)(Run05_uVel_t000900.out)
+  }
+  axis = z
+  bounds = *,*,*,*,*,*
+}
+
+rms {
+  name = bounded_budget_combo_rms
+  expr {
+    (1.0)(Run05_budget0_term04_t000900_n123456.s3D)
+  + (-1.0)(Run05_budget0_term05_t000900_n123456.s3D)
+  }
+  axis = y
+  bounds = 0.0,317.4603175,*,*,0.0,55.55555556
+}

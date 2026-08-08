@@ -1,0 +1,20 @@
+# ABL stress method.
+# The diagnostic is role-based: uw and vw are assembled independently, then
+# sqrt(uw**2 + vw**2) is used for threshold-crossing height.
+
+driver = abl
+
+abl {
+  method = stress
+  threshold = 0.05
+
+  uw {
+    (1.0)(Run05_budget0_term06_t000900_n123456.s3D)
+  + (1.0)(Run05_budget0_term13_t000900_n123456.s3D)
+  }
+
+  vw {
+    (1.0)(Run05_budget0_term08_t000900_n123456.s3D)
+  + (1.0)(Run05_budget0_term15_t000900_n123456.s3D)
+  }
+}

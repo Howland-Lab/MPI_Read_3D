@@ -1,13 +1,192 @@
-# MPI Fortran program for reading and diagnosing large PadeOps output files
+# MPI Read 3D Diagnostics
 
-If reading and analyzing PadeOps output files using the Python scripts in PadeOpsIO is too heavy, this Fortran program can be used. 
+MPI Read 3D is a Fortran/MPI diagnostic tool for large PadeOps 3D output fields.  It uses the same `2decomp_fft` I/O layer as PadeOps, so large fields can be read in parallel instead of loading full arrays through Python.
 
-The program uses the 2decomp_fft library to read PadeOps output files, which is the same library used by PadeOps to export the output files. 
+The active implementation is the lean direct-filename program:
 
-The program relies on MPI to divide reading the heavy PadeOps output files among the MPI processes, making it much faster than a numpy-based read in Python. 
+```text
+mpi_diag_lean.F90
+```
 
-The **build_*.sh** attached script should be modified bases on the HPC platform. Ideally, set **DECOMP_DIR** to the same 2decomp_fft path that PadeOps uses. 
+The old keyword/budget-driven implementation has been archived in:
 
-The current version of the program performs horizontal averaging of different fields as specified by the input file **input.dat**. The program writes the generated horizontally averaged profiles to **csv** files. Further capabilities will be included, such as exporting slices through a three-dimensional field.
+```text
+legacy/
+```
 
-To use the program, please run the build shell script, after modification based on the used platform. A sample job script is included (**run**), which should also be modified accordingly.
+## Build
+
+Use the unified build script:
+
+```bash
+./build_lean.sh anvil gcc
+./build_lean.sh anvil impi
+./build_lean.sh archer2
+./build_lean.sh stampede3 gcc
+./build_lean.sh stampede3 impi
+```
+
+Each local setup file in `setup/` sources the matching PadeOps environment first, then loads only the extra NetCDF module needed by this diagnostic program.  This keeps the compiler, MPI, and `2decomp_fft` stack aligned with the PadeOps build.
+
+The build produces:
+
+```text
+build/gcc/MPIR3D_lean
+build/impi/MPIR3D_lean
+```
+
+Archer2 currently has a single stack, so its default output remains
+`build/MPIR3D_lean`.
+
+You can override the default PadeOps root if needed:
+
+```bash
+PADEOPS_ROOT=/path/to/PadeOps ./build_lean.sh anvil gcc
+```
+
+## Input Model
+
+The lean program does not use legacy budget keywords.  Fields are read by direct filenames.  Relative filenames are resolved under `path`; absolute filenames are used as-is.
+
+Linear field composition is supported:
+
+```text
+expr {
+  (1.0)(file_a.s3D)
++ (-2.0)(file_b.s3D)
++ (1.0)(file_c.s3D)
+}
+```
+
+The executable reads a small namelist plus a diagnostic map:
+
+```fortran
+&SETUP
+  nx       = 1330
+  ny       = 466
+  nz       = 700
+  Lx       = 317.4603175D0
+  Ly       = 55.55555555555D0
+  Lz       = 55.55555555555D0
+  path     = "/path/to/padeops/output"
+  outdir   = "/path/to/diagnostic/output"
+  driver   = "slice"
+  diag_map = "examples/slice_map.diag"
+/
+```
+
+Run with MPI:
+
+```bash
+mpirun -np 16 ./build/gcc/MPIR3D_lean examples/slice_input.dat
+```
+
+Use the launcher appropriate to the machine, for example `srun` on Slurm systems.
+
+## Drivers
+
+The current lean drivers are:
+
+```text
+ha      horizontal average
+slice   2D slices and integrated slices
+rms     cross-plane L2 norm profiles
+abl     ABL height diagnostics
+```
+
+For slices, all `slices {}` blocks operate on all fields:
+
+```text
+fields {
+  name = u
+  expr {
+    (1.0)(Run05_uVel_t000900.out)
+  }
+
+  name = combo
+  expr {
+    (1.0)(file1.s3D)
+  + (-1.0)(file2.s3D)
+  }
+}
+
+slices {
+  axis = y
+  coords = 5.0,15.0,25.0
+  integrate = 0
+}
+```
+
+Expression signs belong inside the coefficient parentheses. Use
+`(-2.0)(file_b.s3D)`, not `- (2.0)(file_b.s3D)`.
+
+This structure is intended for large batches: each field is assembled once, then every requested slice is extracted from that in-memory field.
+
+The HA driver also supports a role-based derived field for wind speed and
+wind direction:
+
+```text
+fields {
+  name = wind
+  derived = ws_wd
+
+  u {
+    (1.0)(Run05_uVel_t000900.out)
+  }
+
+  v {
+    (1.0)(Run05_vVel_t000900.out)
+  }
+}
+```
+
+This writes `wind_WS_HA_z.csv` and `wind_WD_HA_z.csv`. Wind speed is the
+horizontal mean of pointwise `sqrt(u*u + v*v)`. Wind direction is computed
+from the horizontally averaged vector, `atan2(<v>,<u>) * 180/pi`, as a
+mathematical angle in degrees counter-clockwise from +x. It is not converted
+to meteorological direction.
+
+RMS-map `bounds` entries use `*` for open sides:
+
+```text
+bounds = xmin,xmax,ymin,ymax,zmin,zmax
+bounds = *,*,*,*,*,*
+```
+
+The `rms` driver exports `sqrt(integral f**2 dA)`, a cross-plane L2 norm. Area normalization to form RMS is done offline.
+
+## Examples
+
+Copy and edit the templates in `examples/`:
+
+```text
+examples/ha_input.dat
+examples/ha_map.diag
+examples/ha_wind_input.dat
+examples/ha_wind_map.diag
+examples/slice_input.dat
+examples/slice_map.diag
+examples/rms_input.dat
+examples/rms_map.diag
+examples/abl_input.dat
+examples/abl_stress_map.diag
+examples/abl_inversion_map.diag
+```
+
+## Legacy
+
+The legacy implementation remains available for reference and old workflows:
+
+```text
+legacy/mpi_diag.F90
+legacy/build_Anvil.sh
+legacy/build_Archer2.sh
+legacy/build_Engaging.sh
+legacy/build_Stampede3.sh
+legacy/input.dat
+legacy/run
+```
+
+Existing legacy build artifacts, if present, are also kept in `legacy/`.
+
+New development should target `mpi_diag_lean.F90`.

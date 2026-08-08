@@ -1,0 +1,25 @@
+# Horizontal-average driver.
+# Every field listed here is assembled once and horizontally averaged over x-y.
+# A field can be a single direct file or a linear combination of direct files.
+
+driver = ha
+
+fields {
+  name = u
+  expr {
+    (1.0)(Run05_uVel_t000900.out)
+  }
+
+  name = uv_linear_combo
+  expr {
+    (1.0)(Run05_uVel_t000900.out)
+  + (1.0)(Run05_vVel_t000900.out)
+  }
+
+  name = budget_combo
+  expr {
+    (1.0)(Run05_budget0_term04_t000900_n123456.s3D)
+  + (-2.0)(Run05_budget0_term05_t000900_n123456.s3D)
+  + (1.0)(Run05_budget0_term06_t000900_n123456.s3D)
+  }
+}

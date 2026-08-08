@@ -1,0 +1,45 @@
+# Slice driver.
+# All slice blocks operate on all fields.  This is the efficient layout for
+# many fields and many slices: each field is read/assembled once, then every
+# requested slice is extracted from that in-memory field.
+
+driver = slice
+
+fields {
+  name = u
+  expr {
+    (1.0)(Run05_uVel_t000900.out)
+  }
+
+  name = composed_budget_field
+  expr {
+    (1.0)(Run05_comp_deficit_budget1_term03_t000900_n123456.s3D)
+  + (-2.0)(Run05_comp_deficit_budget1_term07_t000900_n123456.s3D)
+  + (1.0)(Run05_comp_deficit_budget1_term09_t000900_n123456.s3D)
+  }
+}
+
+slices {
+  axis = x
+  coords = 10.0,20.0,30.0
+  integrate = 0
+}
+
+slices {
+  axis = y
+  coords = 5.0,15.0,25.0,27.78
+  integrate = 0
+}
+
+slices {
+  axis = z
+  coords = 1.0,2.0,3.0,4.0
+  integrate = 0
+}
+
+# Integrated slices omit coords.  integrate = 2 means
+# ( integral field**2 d_axis )**(1/2).
+slices {
+  axis = z
+  integrate = 2
+}

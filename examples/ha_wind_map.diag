@@ -1,0 +1,22 @@
+# Horizontal averages of wind speed and wind direction.
+# This derived field is supported by the HA driver only.
+# The u and v roles can each be a single file or a linear combination.
+#
+# Wind speed output is the horizontal mean of pointwise sqrt(u*u + v*v).
+# Wind direction output is atan2(<v>,<u>) * 180/pi, using the mathematical
+# convention: counter-clockwise degrees from +x, not meteorological direction.
+
+driver = ha
+
+fields {
+  name = wind
+  derived = ws_wd
+
+  u {
+    (1.0)(Run05_uVel_t000900.out)
+  }
+
+  v {
+    (1.0)(Run05_vVel_t000900.out)
+  }
+}
