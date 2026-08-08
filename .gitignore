@@ -1,3 +1,4 @@
 *.mod
 *.png
 MPIR3D
+build/*
