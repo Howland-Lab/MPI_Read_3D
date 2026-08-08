@@ -600,10 +600,11 @@ contains
     integer :: iterm, idx
 
     f = 0.0_rk
+    allocate(tmp(size(f,1), size(f,2), size(f,3)))
     do iterm = 1, nterms
       idx = merge(1, icase, lists(iterm)%n == 1)
       call message('Reading '//trim(lists(iterm)%names(idx)))
-      tmp = reader%read_field(trim(lists(iterm)%names(idx)))
+      call reader%read_field(trim(lists(iterm)%names(idx)), tmp)
       f = f + terms(iterm)%coeff * tmp
     end do
   end subroutine assemble_terms_case
@@ -1877,10 +1878,10 @@ contains
     this%is_init = .true.
   end subroutine frd_init
 
-  function frd_read_field(this, path) result(field)
+  subroutine frd_read_field(this, path, field)
     class(FieldReader2Decomp), intent(inout) :: this
     character(*), intent(in) :: path
-    real(rk), allocatable :: field(:,:,:)
+    real(rk), intent(out) :: field(this%nxloc,this%nyloc,this%nzloc)
     integer :: ierr
     logical :: exists
     if (.not. this%is_init) then
@@ -1892,9 +1893,8 @@ contains
       call message('ERROR: input field file does not exist: '//trim(path))
       call MPI_Abort(MPI_COMM_WORLD, 102, ierr)
     end if
-    allocate(field(this%nxloc,this%nyloc,this%nzloc))
     call decomp_2d_read_one(1, field, trim(path), this%gpC)
-  end function frd_read_field
+  end subroutine frd_read_field
 
   subroutine frd_global_shape(this, nx, ny, nz)
     class(FieldReader2Decomp), intent(in) :: this
