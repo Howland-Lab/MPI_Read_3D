@@ -117,6 +117,19 @@ slices {
 }
 ```
 
+Wildcards in filenames are treated as a time/case dimension, not as a
+summation. The program expands each wildcard pattern as a sorted list and runs
+the selected driver once per case. In a composed field, each term must expand
+to either one file, reused for every case, or to the same number of files as
+the other wildcard terms:
+
+```text
+expr {
+  (1.0)(Run05_uVel_t*.out)
++ (-1.0)(Run05_uMean.out)
+}
+```
+
 Expression signs belong inside the coefficient parentheses. Use
 `(-2.0)(file_b.s3D)`, not `- (2.0)(file_b.s3D)`.
 
@@ -131,20 +144,24 @@ fields {
   derived = ws_wd
 
   u {
-    (1.0)(Run05_uVel_t000900.out)
+    (1.0)(Run05_uVel_t*.out)
   }
 
   v {
-    (1.0)(Run05_vVel_t000900.out)
+    (1.0)(Run05_vVel_t*.out)
   }
 }
 ```
 
-This writes `wind_WS_HA_z.csv` and `wind_WD_HA_z.csv`. Wind speed is the
-horizontal mean of pointwise `sqrt(u*u + v*v)`. Wind direction is computed
-from the horizontally averaged vector, `atan2(<v>,<u>) * 180/pi`, as a
-mathematical angle in degrees counter-clockwise from +x. It is not converted
-to meteorological direction.
+For wildcard input, the driver writes one output per match, for example
+`wind_Run05_uVel_t000900_WS_HA_z.csv` and
+`wind_Run05_uVel_t000900_WD_HA_z.csv`. The sorted `u` and `v` matches are
+paired one-to-one, so use filename patterns that sort in timestep order.
+
+Wind speed is the horizontal mean of pointwise `sqrt(u*u + v*v)`. Wind
+direction is computed from the horizontally averaged vector,
+`atan2(<v>,<u>) * 180/pi`, as a mathematical angle in degrees
+counter-clockwise from +x. It is not converted to meteorological direction.
 
 RMS-map `bounds` entries use `*` for open sides:
 

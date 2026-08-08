@@ -33,6 +33,7 @@ module MPIR3D_Lean
   integer, parameter :: name_len = 128
   integer :: myrank = -1
   integer :: nprocs = -1
+  integer :: glob_counter = 0
 
   type :: FieldReader2Decomp
      private
@@ -56,6 +57,11 @@ module MPIR3D_Lean
     real(rk) :: coeff = 1.0_rk
     character(len=str_len) :: filename = ''
   end type field_term_t
+
+  type :: file_list_t
+    integer :: n = 0
+    character(len=str_len), allocatable :: names(:)
+  end type file_list_t
 
   type :: field_expr_t
     character(len=name_len) :: name = ''
@@ -199,6 +205,42 @@ contains
       fullpath = trim(root)//'/'//trim(filename)
     end if
   end function resolve_input_path
+
+  pure logical function has_wildcard(text)
+    character(*), intent(in) :: text
+    has_wildcard = index(text, '*') > 0 .or. index(text, '?') > 0 .or. index(text, '[') > 0
+  end function has_wildcard
+
+  function dirname_only(filename) result(dir)
+    character(*), intent(in) :: filename
+    character(len=:), allocatable :: dir
+    integer :: i, last, n
+    n = len_trim(filename)
+    last = 0
+    do i = n, 1, -1
+      if (filename(i:i) == '/') then
+        last = i
+        exit
+      end if
+    end do
+    if (last <= 0) then
+      dir = '.'
+    else if (last == 1) then
+      dir = '/'
+    else
+      dir = filename(:last-1)
+    end if
+  end function dirname_only
+
+  function shell_quote(text) result(quoted)
+    character(*), intent(in) :: text
+    character(len=:), allocatable :: quoted
+    if (index(text, "'") > 0) then
+      quoted = "''"
+    else
+      quoted = "'"//trim(text)//"'"
+    end if
+  end function shell_quote
 
   function basename_only(filename) result(base)
     character(*), intent(in) :: filename
@@ -394,6 +436,201 @@ contains
 
     if (nterms <= 0) ierr = 15
   end subroutine parse_term_list
+
+  subroutine expand_file_pattern(pattern, files, nfiles, ierr)
+    character(*), intent(in) :: pattern
+    character(len=str_len), allocatable, intent(out) :: files(:)
+    integer, intent(out) :: nfiles, ierr
+    character(len=:), allocatable :: dir, leaf, qdir, qleaf, qtmp, cmd
+    character(len=str_len), allocatable :: filebuf(:)
+    character(len=str_len) :: line, tmpfile, tmpdir
+    integer :: unit, ios, exitstat, cmdstat, ifile, mpi_ierr, clock_count
+    logical :: opened
+
+    ierr = 0
+    nfiles = 0
+    opened = .false.
+    if (allocated(files)) deallocate(files)
+
+    if (index(pattern, "'") > 0) then
+      ierr = 610
+    end if
+
+    if (ierr == 0 .and. myrank == 0) then
+      dir = dirname_only(trim(pattern))
+      leaf = basename_only(trim(pattern))
+      qdir = shell_quote(trim(dir))
+      qleaf = shell_quote(trim(leaf))
+
+      ! Only rank 0 creates temp files; glob_counter is meaningful only on rank 0.
+      glob_counter = glob_counter + 1
+      call get_environment_variable('TMPDIR', tmpdir)
+      if (len_trim(tmpdir) == 0) tmpdir = '/tmp'
+      call system_clock(count=clock_count)
+      write(tmpfile,'(A,A,I0,A,I0,A,I0,A)') trim(tmpdir), '/mpir3d_glob_', myrank, '_', glob_counter, '_', clock_count, '.lst'
+      if (index(tmpfile, "'") > 0) then
+        ierr = 610
+      else
+        qtmp = shell_quote(trim(tmpfile))
+        cmd = 'find '//trim(qdir)//' -maxdepth 1 -type f -name '//trim(qleaf)//' | sort > '//trim(qtmp)
+        call execute_command_line(trim(cmd), exitstat=exitstat, cmdstat=cmdstat)
+        if (cmdstat /= 0 .or. exitstat /= 0) ierr = 611
+        if (ierr == 611 .and. cmdstat == 0) then
+          open(newunit=unit, file=trim(tmpfile), status='old', action='readwrite', iostat=ios)
+          if (ios == 0) close(unit, status='delete')
+        end if
+      end if
+
+      if (ierr == 0) then
+        open(newunit=unit, file=trim(tmpfile), status='old', action='read', iostat=ios)
+        if (ios /= 0) then
+          ierr = 612
+        else
+          opened = .true.
+        end if
+      end if
+
+      if (ierr == 0) then
+        do
+          read(unit,'(A)',iostat=ios) line
+          if (ios /= 0) exit
+          if (len_trim(line) > 0) nfiles = nfiles + 1
+        end do
+        if (nfiles <= 0) ierr = 613
+      end if
+
+      if (ierr == 0) then
+        rewind(unit)
+        allocate(files(nfiles))
+        do ifile = 1, nfiles
+          read(unit,'(A)',iostat=ios) line
+          if (ios /= 0) then
+            ierr = 614
+            exit
+          end if
+          files(ifile) = trim(line)
+        end do
+      end if
+
+      if (opened .and. (ierr == 0 .or. ierr == 613 .or. ierr == 614)) then
+        close(unit, status='delete')
+      else if (opened) then
+        ! Defensive fallback for future error paths after a successful open.
+        close(unit)
+      end if
+    end if
+
+    call MPI_Bcast(ierr, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, mpi_ierr)
+    if (ierr /= 0) return
+
+    call MPI_Bcast(nfiles, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, mpi_ierr)
+    allocate(filebuf(nfiles))
+    if (myrank == 0) filebuf = files
+    call MPI_Bcast(filebuf, nfiles * str_len, MPI_CHARACTER, 0, MPI_COMM_WORLD, mpi_ierr)
+    if (myrank /= 0) then
+      allocate(files(nfiles))
+      files = filebuf
+    end if
+  end subroutine expand_file_pattern
+
+  subroutine expand_terms(root, terms, nterms, lists, ncases, ierr)
+    character(*), intent(in) :: root
+    type(field_term_t), intent(in) :: terms(:)
+    integer, intent(in) :: nterms
+    type(file_list_t), allocatable, intent(out) :: lists(:)
+    integer, intent(out) :: ncases, ierr
+    character(len=:), allocatable :: infile
+    integer :: iterm
+
+    ierr = 0
+    ncases = 1
+    if (allocated(lists)) deallocate(lists)
+    if (nterms <= 0) then
+      ierr = 621
+      return
+    end if
+    allocate(lists(nterms))
+
+    do iterm = 1, nterms
+      infile = resolve_input_path(trim(root), trim(terms(iterm)%filename))
+      if (has_wildcard(trim(infile))) then
+        call expand_file_pattern(trim(infile), lists(iterm)%names, lists(iterm)%n, ierr)
+        if (ierr /= 0) return
+      else
+        lists(iterm)%n = 1
+        allocate(lists(iterm)%names(1))
+        lists(iterm)%names(1) = trim(infile)
+      end if
+      ncases = max(ncases, lists(iterm)%n)
+    end do
+
+    do iterm = 1, nterms
+      if (lists(iterm)%n /= 1 .and. lists(iterm)%n /= ncases) then
+        ierr = 620
+        return
+      end if
+    end do
+  end subroutine expand_terms
+
+  subroutine abort_expand_error(ierr_in)
+    integer, intent(in) :: ierr_in
+    integer :: mpi_ierr
+    select case(ierr_in)
+    case(610)
+      call message('ERROR: wildcard paths containing single quotes are not supported.')
+    case(613)
+      call message('ERROR: wildcard pattern matched no files.')
+    case(620)
+      call message('ERROR: wildcard terms in one expression must have either one match or the same number of matches.')
+    case(621)
+      call message('ERROR: field expression has no input terms.')
+    case default
+      call message('ERROR: failed to expand wildcard input pattern.')
+    end select
+    call MPI_Abort(MPI_COMM_WORLD, 800 + ierr_in, mpi_ierr)
+  end subroutine abort_expand_error
+
+  subroutine assemble_terms_case(reader, terms, nterms, lists, icase, f)
+    class(FieldReader2Decomp), intent(inout) :: reader
+    type(field_term_t), intent(in) :: terms(:)
+    integer, intent(in) :: nterms, icase
+    type(file_list_t), intent(in) :: lists(:)
+    real(rk), intent(out) :: f(:,:,:)
+    real(rk), allocatable :: tmp(:,:,:)
+    integer :: iterm, idx
+
+    f = 0.0_rk
+    do iterm = 1, nterms
+      idx = merge(1, icase, lists(iterm)%n == 1)
+      call message('Reading '//trim(lists(iterm)%names(idx)))
+      tmp = reader%read_field(trim(lists(iterm)%names(idx)))
+      f = f + terms(iterm)%coeff * tmp
+    end do
+  end subroutine assemble_terms_case
+
+  function expr_output_stem_case(expr, lists, nlists, icase) result(stem)
+    type(field_expr_t), intent(in) :: expr
+    type(file_list_t), intent(in) :: lists(:)
+    integer, intent(in) :: nlists, icase
+    character(len=:), allocatable :: stem
+    character(len=:), allocatable :: leaf
+    integer :: i, idx
+
+    do i = 1, nlists
+      if (lists(i)%n > 1) then
+        ! For multi-wildcard compositions, the first time-varying term names the output case.
+        idx = min(icase, lists(i)%n)
+        leaf = strip_extension(trim(basename_only(trim(lists(i)%names(idx)))))
+        if (len_trim(expr%name) > 0) then
+          stem = trim(expr%name)//'_'//trim(leaf)
+        else
+          stem = trim(leaf)
+        end if
+        return
+      end if
+    end do
+    stem = expr_output_stem(expr)
+  end function expr_output_stem_case
 
   subroutine skip_spaces(s, pos, n)
     character(*), intent(in) :: s
@@ -889,47 +1126,6 @@ contains
     coord_in_bounds = coord >= item%bounds_min(iax) .and. coord <= item%bounds_max(iax)
   end function coord_in_bounds
 
-  subroutine assemble_field(reader, root, expr, f)
-    class(FieldReader2Decomp), intent(inout) :: reader
-    character(*), intent(in) :: root
-    type(field_expr_t), intent(in) :: expr
-    real(rk), intent(out) :: f(:,:,:)
-    real(rk), allocatable :: tmp(:,:,:)
-    character(len=:), allocatable :: infile
-    integer :: iterm, ierr
-
-    if (expr%nterms <= 0) then
-      call message('ERROR: field expression has no direct terms. Derived fields are only supported by selected drivers.')
-      call MPI_Abort(MPI_COMM_WORLD, 810, ierr)
-    end if
-    f = 0.0_rk
-    do iterm = 1, expr%nterms
-      infile = resolve_input_path(trim(root), trim(expr%terms(iterm)%filename))
-      call message('Reading '//trim(infile))
-      tmp = reader%read_field(trim(infile))
-      f = f + expr%terms(iterm)%coeff * tmp
-    end do
-  end subroutine assemble_field
-
-  subroutine assemble_terms(reader, root, terms, nterms, f)
-    class(FieldReader2Decomp), intent(inout) :: reader
-    character(*), intent(in) :: root
-    type(field_term_t), intent(in) :: terms(:)
-    integer, intent(in) :: nterms
-    real(rk), intent(out) :: f(:,:,:)
-    real(rk), allocatable :: tmp(:,:,:)
-    character(len=:), allocatable :: infile
-    integer :: iterm
-
-    f = 0.0_rk
-    do iterm = 1, nterms
-      infile = resolve_input_path(trim(root), trim(terms(iterm)%filename))
-      call message('Reading '//trim(infile))
-      tmp = reader%read_field(trim(infile))
-      f = f + terms(iterm)%coeff * tmp
-    end do
-  end subroutine assemble_terms
-
   subroutine create_grid(Lx, Ly, Lz, nx, ny, nz, x, y, z)
     real(rk), intent(in) :: Lx, Ly, Lz
     integer, intent(in) :: nx, ny, nz
@@ -972,7 +1168,9 @@ contains
     character(*), intent(in) :: path, outdir
     type(diag_job_t), intent(in) :: job
     integer :: nx, ny, nz, nxloc, nyloc, nzloc, xs, xe, ys, ye, zs, ze, i, k
+    integer :: icase, ncases, ncases_u, ncases_v, ierr
     real(rk), allocatable :: f(:,:,:), f2(:,:,:), f3(:,:,:), x(:), y(:), z(:), profile(:), profile_u(:), profile_v(:)
+    type(file_list_t), allocatable :: lists(:), u_lists(:), v_lists(:)
     character(len=:), allocatable :: outname, stem
     real(rk) :: pi
 
@@ -986,36 +1184,52 @@ contains
 
     do i = 1, job%nfields
       if (trim(job%fields(i)%derived) == 'ws_wd') then
-        call assemble_terms(reader, path, job%fields(i)%u_terms, job%fields(i)%nu_terms, f)
-        call assemble_terms(reader, path, job%fields(i)%v_terms, job%fields(i)%nv_terms, f2)
-        stem = expr_output_stem(job%fields(i))
-
-        ! WS profile is <sqrt(u*u + v*v)>, not sqrt(<u>**2 + <v>**2).
-        f3 = sqrt(f*f + f2*f2)
-        call do_horizontal_average(nx, ny, nz, nxloc, nyloc, nzloc, zs, f3, profile)
-        if (myrank == 0) then
-          outname = trim(outdir)//'/'//trim(stem)//'_WS_HA_z.csv'
-          call csv_profile(nz, trim(outname), 'z', z, profile)
+        call expand_terms(path, job%fields(i)%u_terms, job%fields(i)%nu_terms, u_lists, ncases_u, ierr)
+        if (ierr /= 0) call abort_expand_error(ierr)
+        call expand_terms(path, job%fields(i)%v_terms, job%fields(i)%nv_terms, v_lists, ncases_v, ierr)
+        if (ierr /= 0) call abort_expand_error(ierr)
+        ncases = max(ncases_u, ncases_v)
+        if ((ncases_u /= 1 .and. ncases_u /= ncases) .or. (ncases_v /= 1 .and. ncases_v /= ncases)) then
+          call message('ERROR: ws_wd wildcard u/v series must have the same number of matches.')
+          call MPI_Abort(MPI_COMM_WORLD, 821, ierr)
         end if
 
-        call do_horizontal_average(nx, ny, nz, nxloc, nyloc, nzloc, zs, f, profile_u)
-        call do_horizontal_average(nx, ny, nz, nxloc, nyloc, nzloc, zs, f2, profile_v)
-        ! Mathematical direction: counter-clockwise degrees from +x, not meteorological direction.
-        do k = 1, nz
-          profile(k) = atan2(profile_v(k), profile_u(k)) * 180.0_rk / pi
+        do icase = 1, ncases
+          call assemble_terms_case(reader, job%fields(i)%u_terms, job%fields(i)%nu_terms, u_lists, icase, f)
+          call assemble_terms_case(reader, job%fields(i)%v_terms, job%fields(i)%nv_terms, v_lists, icase, f2)
+          stem = expr_output_stem_case(job%fields(i), u_lists, job%fields(i)%nu_terms, icase)
+
+          ! WS profile is <sqrt(u*u + v*v)>, not sqrt(<u>**2 + <v>**2).
+          f3 = sqrt(f*f + f2*f2)
+          call do_horizontal_average(nx, ny, nz, nxloc, nyloc, nzloc, zs, f3, profile)
+          if (myrank == 0) then
+            outname = trim(outdir)//'/'//trim(stem)//'_WS_HA_z.csv'
+            call csv_profile(nz, trim(outname), 'z', z, profile)
+          end if
+
+          call do_horizontal_average(nx, ny, nz, nxloc, nyloc, nzloc, zs, f, profile_u)
+          call do_horizontal_average(nx, ny, nz, nxloc, nyloc, nzloc, zs, f2, profile_v)
+          ! Mathematical direction: counter-clockwise degrees from +x, not meteorological direction.
+          do k = 1, nz
+            profile(k) = atan2(profile_v(k), profile_u(k)) * 180.0_rk / pi
+          end do
+          if (myrank == 0) then
+            outname = trim(outdir)//'/'//trim(stem)//'_WD_HA_z.csv'
+            call csv_profile(nz, trim(outname), 'z', z, profile)
+          end if
         end do
-        if (myrank == 0) then
-          outname = trim(outdir)//'/'//trim(stem)//'_WD_HA_z.csv'
-          call csv_profile(nz, trim(outname), 'z', z, profile)
-        end if
       else
-        call assemble_field(reader, path, job%fields(i), f)
-        call do_horizontal_average(nx, ny, nz, nxloc, nyloc, nzloc, zs, f, profile)
-        if (myrank == 0) then
-          stem = expr_output_stem(job%fields(i))
-          outname = trim(outdir)//'/'//trim(stem)//'_HA_z.csv'
-          call csv_profile(nz, trim(outname), 'z', z, profile)
-        end if
+        call expand_terms(path, job%fields(i)%terms, job%fields(i)%nterms, lists, ncases, ierr)
+        if (ierr /= 0) call abort_expand_error(ierr)
+        do icase = 1, ncases
+          call assemble_terms_case(reader, job%fields(i)%terms, job%fields(i)%nterms, lists, icase, f)
+          call do_horizontal_average(nx, ny, nz, nxloc, nyloc, nzloc, zs, f, profile)
+          if (myrank == 0) then
+            stem = expr_output_stem_case(job%fields(i), lists, job%fields(i)%nterms, icase)
+            outname = trim(outdir)//'/'//trim(stem)//'_HA_z.csv'
+            call csv_profile(nz, trim(outname), 'z', z, profile)
+          end if
+        end do
       end if
     end do
   end subroutine run_horizontal_average
@@ -1026,11 +1240,12 @@ contains
     character(*), intent(in) :: path, outdir
     type(diag_job_t), intent(in) :: job
     integer :: nx, ny, nz, nxloc, nyloc, nzloc, xs, xe, ys, ye, zs, ze
-    integer :: ip, i, j, k, ig, jg, kg, ni, profile_axis, ierr
+    integer :: ip, i, j, k, ig, jg, kg, ni, profile_axis, ierr, icase, ncases
     real(rk) :: dx, dy, dz, area_weight
     real(rk), allocatable, target :: x(:), y(:), z(:)
     real(rk), pointer :: coord(:)
     real(rk), allocatable :: f(:,:,:), local_sum(:), global_sum(:), l2norm(:)
+    type(file_list_t), allocatable :: lists(:)
     character(len=:), allocatable :: outname, stem
 
     call reader%global_shape(nx, ny, nz)
@@ -1041,7 +1256,8 @@ contains
     dx = Lx/real(nx,rk); dy = Ly/real(ny,rk); dz = Lz/real(nz,rk)
 
     do ip = 1, job%nrms
-      call assemble_field(reader, path, job%rms(ip)%field, f)
+      call expand_terms(path, job%rms(ip)%field%terms, job%rms(ip)%field%nterms, lists, ncases, ierr)
+      if (ierr /= 0) call abort_expand_error(ierr)
       select case(job%rms(ip)%axis)
       case('x')
         ni = nx; coord => x; area_weight = dy*dz; profile_axis = 1
@@ -1050,64 +1266,67 @@ contains
       case default
         ni = nz; coord => z; area_weight = dx*dy; profile_axis = 3
       end select
-      allocate(local_sum(ni), global_sum(ni), l2norm(ni))
-      local_sum = 0.0_rk
+      do icase = 1, ncases
+        call assemble_terms_case(reader, job%rms(ip)%field%terms, job%rms(ip)%field%nterms, lists, icase, f)
+        allocate(local_sum(ni), global_sum(ni), l2norm(ni))
+        local_sum = 0.0_rk
 
-      select case(job%rms(ip)%axis)
-      case('x')
-        do i = 1, nxloc
-          ig = xs + i - 1
-          if (.not. coord_in_bounds(x(ig), job%rms(ip), 1)) cycle
-          do j = 1, nyloc
-            jg = ys + j - 1
-            if (.not. coord_in_bounds(y(jg), job%rms(ip), 2)) cycle
-            do k = 1, nzloc
-              kg = zs + k - 1
-              if (.not. coord_in_bounds(z(kg), job%rms(ip), 3)) cycle
-              local_sum(ig) = local_sum(ig) + f(i,j,k)**2 * area_weight
-            end do
-          end do
-        end do
-      case('y')
-        do j = 1, nyloc
-          jg = ys + j - 1
-          if (.not. coord_in_bounds(y(jg), job%rms(ip), 2)) cycle
-          do i = 1, nxloc
-            ig = xs + i - 1
-            if (.not. coord_in_bounds(x(ig), job%rms(ip), 1)) cycle
-            do k = 1, nzloc
-              kg = zs + k - 1
-              if (.not. coord_in_bounds(z(kg), job%rms(ip), 3)) cycle
-              local_sum(jg) = local_sum(jg) + f(i,j,k)**2 * area_weight
-            end do
-          end do
-        end do
-      case default
-        do k = 1, nzloc
-          kg = zs + k - 1
-          if (.not. coord_in_bounds(z(kg), job%rms(ip), 3)) cycle
+        select case(job%rms(ip)%axis)
+        case('x')
           do i = 1, nxloc
             ig = xs + i - 1
             if (.not. coord_in_bounds(x(ig), job%rms(ip), 1)) cycle
             do j = 1, nyloc
               jg = ys + j - 1
               if (.not. coord_in_bounds(y(jg), job%rms(ip), 2)) cycle
-              local_sum(kg) = local_sum(kg) + f(i,j,k)**2 * area_weight
+              do k = 1, nzloc
+                kg = zs + k - 1
+                if (.not. coord_in_bounds(z(kg), job%rms(ip), 3)) cycle
+                local_sum(ig) = local_sum(ig) + f(i,j,k)**2 * area_weight
+              end do
             end do
           end do
-        end do
-      end select
+        case('y')
+          do j = 1, nyloc
+            jg = ys + j - 1
+            if (.not. coord_in_bounds(y(jg), job%rms(ip), 2)) cycle
+            do i = 1, nxloc
+              ig = xs + i - 1
+              if (.not. coord_in_bounds(x(ig), job%rms(ip), 1)) cycle
+              do k = 1, nzloc
+                kg = zs + k - 1
+                if (.not. coord_in_bounds(z(kg), job%rms(ip), 3)) cycle
+                local_sum(jg) = local_sum(jg) + f(i,j,k)**2 * area_weight
+              end do
+            end do
+          end do
+        case default
+          do k = 1, nzloc
+            kg = zs + k - 1
+            if (.not. coord_in_bounds(z(kg), job%rms(ip), 3)) cycle
+            do i = 1, nxloc
+              ig = xs + i - 1
+              if (.not. coord_in_bounds(x(ig), job%rms(ip), 1)) cycle
+              do j = 1, nyloc
+                jg = ys + j - 1
+                if (.not. coord_in_bounds(y(jg), job%rms(ip), 2)) cycle
+                local_sum(kg) = local_sum(kg) + f(i,j,k)**2 * area_weight
+              end do
+            end do
+          end do
+        end select
 
-      call MPI_Allreduce(local_sum, global_sum, ni, mpi_rk, MPI_SUM, MPI_COMM_WORLD, ierr)
-      ! This driver exports the cross-plane L2 norm, sqrt(integral f**2 dA).
-      ! Area normalization to convert this profile to RMS is done offline.
-      l2norm = sqrt(global_sum)
-      if (myrank == 0) then
-        stem = expr_output_stem(job%rms(ip)%field)
-        outname = trim(outdir)//'/'//trim(stem)//'_rms_'//job%rms(ip)%axis//'.csv'
-        call csv_profile_bounded(ni, trim(outname), job%rms(ip)%axis, coord, l2norm, job%rms(ip), profile_axis)
-      end if
-      deallocate(local_sum, global_sum, l2norm)
+        call MPI_Allreduce(local_sum, global_sum, ni, mpi_rk, MPI_SUM, MPI_COMM_WORLD, ierr)
+        ! This driver exports the cross-plane L2 norm, sqrt(integral f**2 dA).
+        ! Area normalization to convert this profile to RMS is done offline.
+        l2norm = sqrt(global_sum)
+        if (myrank == 0) then
+          stem = expr_output_stem_case(job%rms(ip)%field, lists, job%rms(ip)%field%nterms, icase)
+          outname = trim(outdir)//'/'//trim(stem)//'_rms_'//job%rms(ip)%axis//'.csv'
+          call csv_profile_bounded(ni, trim(outname), job%rms(ip)%axis, coord, l2norm, job%rms(ip), profile_axis)
+        end if
+        deallocate(local_sum, global_sum, l2norm)
+      end do
     end do
   end subroutine run_rms
 
@@ -1116,9 +1335,10 @@ contains
     real(rk), intent(in) :: Lx, Ly, Lz
     character(*), intent(in) :: path, outdir
     type(diag_job_t), intent(in) :: job
-    integer :: nx, ny, nz, nxloc, nyloc, nzloc, ifield, ispec, ierr
+    integer :: nx, ny, nz, nxloc, nyloc, nzloc, ifield, ispec, ierr, icase, ncases
     real(rk), allocatable, target :: x(:), y(:), z(:)
     real(rk), allocatable :: f(:,:,:)
+    type(file_list_t), allocatable :: lists(:)
     character(len=:), allocatable :: stem
 
     call reader%global_shape(nx, ny, nz)
@@ -1131,10 +1351,14 @@ contains
         call message('ERROR: derived fields are not supported by the slice driver.')
         call MPI_Abort(MPI_COMM_WORLD, 811, ierr)
       end if
-      call assemble_field(reader, path, job%fields(ifield), f)
-      stem = expr_output_stem(job%fields(ifield))
-      do ispec = 1, job%nslices
-        call process_slice_spec(reader, f, x, y, z, Lx, Ly, Lz, outdir, trim(stem), job%slices(ispec))
+      call expand_terms(path, job%fields(ifield)%terms, job%fields(ifield)%nterms, lists, ncases, ierr)
+      if (ierr /= 0) call abort_expand_error(ierr)
+      do icase = 1, ncases
+        call assemble_terms_case(reader, job%fields(ifield)%terms, job%fields(ifield)%nterms, lists, icase, f)
+        stem = expr_output_stem_case(job%fields(ifield), lists, job%fields(ifield)%nterms, icase)
+        do ispec = 1, job%nslices
+          call process_slice_spec(reader, f, x, y, z, Lx, Ly, Lz, outdir, trim(stem), job%slices(ispec))
+        end do
       end do
     end do
   end subroutine run_slices
@@ -1246,9 +1470,11 @@ contains
     real(rk), intent(in) :: Lx, Ly, Lz
     character(*), intent(in) :: path, outdir
     type(diag_job_t), intent(in) :: job
-    integer :: nx, ny, nz, nxloc, nyloc, nzloc
+    integer :: nx, ny, nz, nxloc, nyloc, nzloc, icase, ncases, ncases_uw, ncases_vw, ierr
     real(rk), allocatable, target :: x(:), y(:), z(:)
     real(rk), allocatable :: uw(:,:,:), vw(:,:,:), buffer(:,:,:)
+    type(file_list_t), allocatable :: lists(:), uw_lists(:), vw_lists(:)
+    character(len=:), allocatable :: stem
 
     call reader%global_shape(nx, ny, nz)
     call reader%local_shape(nxloc, nyloc, nzloc)
@@ -1258,14 +1484,39 @@ contains
     select case(trim(lower(job%abl%method)))
     case('stress')
       allocate(uw(nxloc,nyloc,nzloc), vw(nxloc,nyloc,nzloc))
-      call assemble_field(reader, path, job%abl%uw, uw)
-      call assemble_field(reader, path, job%abl%vw, vw)
-      buffer = sqrt(uw**2 + vw**2)
-      call export_abl_threshold(reader, buffer, x, y, z, outdir, 'ABL_stress', job%abl%threshold)
+      call expand_terms(path, job%abl%uw%terms, job%abl%uw%nterms, uw_lists, ncases_uw, ierr)
+      if (ierr /= 0) call abort_expand_error(ierr)
+      call expand_terms(path, job%abl%vw%terms, job%abl%vw%nterms, vw_lists, ncases_vw, ierr)
+      if (ierr /= 0) call abort_expand_error(ierr)
+      ncases = max(ncases_uw, ncases_vw)
+      if ((ncases_uw /= 1 .and. ncases_uw /= ncases) .or. (ncases_vw /= 1 .and. ncases_vw /= ncases)) then
+        call message('ERROR: ABL stress wildcard uw/vw series must have the same number of matches.')
+        call MPI_Abort(MPI_COMM_WORLD, 831, ierr)
+      end if
+      do icase = 1, ncases
+        call assemble_terms_case(reader, job%abl%uw%terms, job%abl%uw%nterms, uw_lists, icase, uw)
+        call assemble_terms_case(reader, job%abl%vw%terms, job%abl%vw%nterms, vw_lists, icase, vw)
+        buffer = sqrt(uw**2 + vw**2)
+        if (ncases > 1) then
+          stem = 'ABL_stress_'//trim(expr_output_stem_case(job%abl%uw, uw_lists, job%abl%uw%nterms, icase))
+        else
+          stem = 'ABL_stress'
+        end if
+        call export_abl_threshold(reader, buffer, x, y, z, outdir, trim(stem), job%abl%threshold)
+      end do
     case('inversion')
-      call assemble_field(reader, path, job%abl%theta, buffer)
-      call export_abl_inversion(reader, buffer, x, y, z, outdir, job%abl%lengthscale, &
-        job%abl%inversion_l0, job%abl%inversion_d0, job%abl%inversion_xi)
+      call expand_terms(path, job%abl%theta%terms, job%abl%theta%nterms, lists, ncases, ierr)
+      if (ierr /= 0) call abort_expand_error(ierr)
+      do icase = 1, ncases
+        call assemble_terms_case(reader, job%abl%theta%terms, job%abl%theta%nterms, lists, icase, buffer)
+        if (ncases > 1) then
+          stem = 'ABL_inversion_'//trim(expr_output_stem_case(job%abl%theta, lists, job%abl%theta%nterms, icase))
+        else
+          stem = 'ABL_inversion'
+        end if
+        call export_abl_inversion(reader, buffer, x, y, z, outdir, trim(stem), job%abl%lengthscale, &
+          job%abl%inversion_l0, job%abl%inversion_d0, job%abl%inversion_xi)
+      end do
     case default
       call message('ERROR: ABL method must be stress or inversion.')
     end select
@@ -1297,11 +1548,11 @@ contains
     end if
   end subroutine export_abl_threshold
 
-  subroutine export_abl_inversion(reader, theta, x, y, z, outdir, lengthscale, l0, d0, xi)
+  subroutine export_abl_inversion(reader, theta, x, y, z, outdir, stem, lengthscale, l0, d0, xi)
     class(FieldReader2Decomp), intent(inout) :: reader
     real(rk), intent(in) :: theta(:,:,:), x(:), y(:), z(:), lengthscale
     real(rk), intent(in) :: l0, d0, xi
-    character(*), intent(in) :: outdir
+    character(*), intent(in) :: outdir, stem
     integer :: nx, ny, nz, ic, jc, ig, jg, ierr
     real(rk), allocatable :: ytmp(:,:,:), ztmp(:,:,:), h0(:,:), h2(:,:), global(:,:)
     real(rk), allocatable :: tcol(:), z_m(:)
@@ -1330,10 +1581,10 @@ contains
 
     global = 0.0_rk
     call MPI_Reduce(h0, global, nx*ny, mpi_rk, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
-    if (myrank == 0) call export_slice_to_netcdf(trim(outdir)//'/ABL_inversion_h0.nc', 'ABL_h0', global, x, y, 'x', 'y')
+    if (myrank == 0) call export_slice_to_netcdf(trim(outdir)//'/'//trim(stem)//'_h0.nc', 'ABL_h0', global, x, y, 'x', 'y')
     global = 0.0_rk
     call MPI_Reduce(h2, global, nx*ny, mpi_rk, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
-    if (myrank == 0) call export_slice_to_netcdf(trim(outdir)//'/ABL_inversion_h2.nc', 'ABL_h2', global, x, y, 'x', 'y')
+    if (myrank == 0) call export_slice_to_netcdf(trim(outdir)//'/'//trim(stem)//'_h2.nc', 'ABL_h2', global, x, y, 'x', 'y')
   end subroutine export_abl_inversion
 
   subroutine fit_rz_profile(z, t, n, l0, d0, params)

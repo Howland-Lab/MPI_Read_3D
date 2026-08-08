@@ -1,6 +1,8 @@
 # Horizontal averages of wind speed and wind direction.
 # This derived field is supported by the HA driver only.
 # The u and v roles can each be a single file or a linear combination.
+# Wildcards are expanded as sorted batches. The sorted u and v matches are
+# paired one-to-one, so use filename patterns that sort in timestep order.
 #
 # Wind speed output is the horizontal mean of pointwise sqrt(u*u + v*v).
 # Wind direction output is atan2(<v>,<u>) * 180/pi, using the mathematical
@@ -13,10 +15,10 @@ fields {
   derived = ws_wd
 
   u {
-    (1.0)(Run05_uVel_t000900.out)
+    (1.0)(Run05_uVel_t*.out)
   }
 
   v {
-    (1.0)(Run05_vVel_t000900.out)
+    (1.0)(Run05_vVel_t*.out)
   }
 }
