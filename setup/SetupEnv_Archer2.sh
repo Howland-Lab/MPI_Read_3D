@@ -9,5 +9,5 @@ pushd "${PADEOPS_ROOT}" >/dev/null
 source "${PADEOPS_ROOT}/setup/SetupEnv_Archer2.sh"
 popd >/dev/null
 
-module load cray-netcdf
+module load cray-netcdf-hdf5parallel/4.9.0.7
 module list
