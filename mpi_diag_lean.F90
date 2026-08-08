@@ -1882,9 +1882,15 @@ contains
     character(*), intent(in) :: path
     real(rk), allocatable :: field(:,:,:)
     integer :: ierr
+    logical :: exists
     if (.not. this%is_init) then
       call message('ERROR: FieldReader2Decomp is not initialized before read_field().')
       call MPI_Abort(MPI_COMM_WORLD, 101, ierr)
+    end if
+    inquire(file=trim(path), exist=exists)
+    if (.not. exists) then
+      call message('ERROR: input field file does not exist: '//trim(path))
+      call MPI_Abort(MPI_COMM_WORLD, 102, ierr)
     end if
     allocate(field(this%nxloc,this%nyloc,this%nzloc))
     call decomp_2d_read_one(1, field, trim(path), this%gpC)
