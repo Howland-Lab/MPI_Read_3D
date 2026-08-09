@@ -282,6 +282,56 @@ contains
     end if
   end function strip_extension
 
+  pure logical function is_digit_char(c)
+    character(len=1), intent(in) :: c
+    is_digit_char = (c >= '0' .and. c <= '9')
+  end function is_digit_char
+
+  function legacy_run_time_stem(filename) result(stem)
+    character(*), intent(in) :: filename
+    character(len=:), allocatable :: stem
+    character(len=:), allocatable :: leaf, run_part, time_part
+    integer :: n, irun, run_end, itime, time_end, i
+
+    leaf = strip_extension(trim(basename_only(trim(filename))))
+    n = len_trim(leaf)
+    irun = index(leaf, 'Run')
+    if (irun == 0) then
+      stem = leaf
+      return
+    end if
+
+    run_end = n
+    do i = irun, n
+      if (leaf(i:i) == '_') then
+        run_end = i - 1
+        exit
+      end if
+    end do
+    run_part = leaf(irun:run_end)
+
+    itime = 0
+    do i = 1, n - 2
+      if (leaf(i:i+1) == '_t' .and. is_digit_char(leaf(i+2:i+2))) then
+        itime = i + 2
+      end if
+    end do
+    if (itime == 0) then
+      stem = leaf
+      return
+    end if
+
+    time_end = n
+    do i = itime, n
+      if (leaf(i:i) == '_') then
+        time_end = i - 1
+        exit
+      end if
+    end do
+    time_part = leaf(itime:time_end)
+    stem = trim(run_part)//'_t'//trim(time_part)
+  end function legacy_run_time_stem
+
   function expr_output_stem(expr) result(stem)
     type(field_expr_t), intent(in) :: expr
     character(len=:), allocatable :: stem
@@ -590,22 +640,21 @@ contains
     call MPI_Abort(MPI_COMM_WORLD, 800 + ierr_in, mpi_ierr)
   end subroutine abort_expand_error
 
-  subroutine assemble_terms_case(reader, terms, nterms, lists, icase, f)
+  subroutine assemble_terms_case(reader, terms, nterms, lists, icase, f, scratch)
     class(FieldReader2Decomp), intent(inout) :: reader
     type(field_term_t), intent(in) :: terms(:)
     integer, intent(in) :: nterms, icase
     type(file_list_t), intent(in) :: lists(:)
     real(rk), intent(out) :: f(:,:,:)
-    real(rk), allocatable :: tmp(:,:,:)
+    real(rk), intent(inout) :: scratch(:,:,:)
     integer :: iterm, idx
 
     f = 0.0_rk
-    allocate(tmp(size(f,1), size(f,2), size(f,3)))
     do iterm = 1, nterms
       idx = merge(1, icase, lists(iterm)%n == 1)
       call message('Reading '//trim(lists(iterm)%names(idx)))
-      call reader%read_field(trim(lists(iterm)%names(idx)), tmp)
-      f = f + terms(iterm)%coeff * tmp
+      call reader%read_field(trim(lists(iterm)%names(idx)), scratch)
+      f = f + terms(iterm)%coeff * scratch
     end do
   end subroutine assemble_terms_case
 
@@ -1170,7 +1219,7 @@ contains
     type(diag_job_t), intent(in) :: job
     integer :: nx, ny, nz, nxloc, nyloc, nzloc, xs, xe, ys, ye, zs, ze, i, k
     integer :: icase, ncases, ncases_u, ncases_v, ierr
-    real(rk), allocatable :: f(:,:,:), f2(:,:,:), f3(:,:,:), x(:), y(:), z(:), profile(:), profile_u(:), profile_v(:)
+    real(rk), allocatable :: f(:,:,:), f2(:,:,:), scratch(:,:,:), x(:), y(:), z(:), profile(:), profile_u(:), profile_v(:)
     type(file_list_t), allocatable :: lists(:), u_lists(:), v_lists(:)
     character(len=:), allocatable :: outname, stem
     real(rk) :: pi
@@ -1178,7 +1227,7 @@ contains
     call reader%global_shape(nx, ny, nz)
     call reader%local_shape(nxloc, nyloc, nzloc)
     call reader%indices(xs, xe, ys, ye, zs, ze)
-    allocate(f(nxloc,nyloc,nzloc), f2(nxloc,nyloc,nzloc), f3(nxloc,nyloc,nzloc), &
+    allocate(f(nxloc,nyloc,nzloc), f2(nxloc,nyloc,nzloc), scratch(nxloc,nyloc,nzloc), &
       x(nx), y(ny), z(nz), profile(nz), profile_u(nz), profile_v(nz))
     call create_grid(Lx, Ly, Lz, nx, ny, nz, x, y, z)
     pi = acos(-1.0_rk)
@@ -1196,13 +1245,13 @@ contains
         end if
 
         do icase = 1, ncases
-          call assemble_terms_case(reader, job%fields(i)%u_terms, job%fields(i)%nu_terms, u_lists, icase, f)
-          call assemble_terms_case(reader, job%fields(i)%v_terms, job%fields(i)%nv_terms, v_lists, icase, f2)
+          call assemble_terms_case(reader, job%fields(i)%u_terms, job%fields(i)%nu_terms, u_lists, icase, f, scratch)
+          call assemble_terms_case(reader, job%fields(i)%v_terms, job%fields(i)%nv_terms, v_lists, icase, f2, scratch)
           stem = expr_output_stem_case(job%fields(i), u_lists, job%fields(i)%nu_terms, icase)
 
           ! WS profile is <sqrt(u*u + v*v)>, not sqrt(<u>**2 + <v>**2).
-          f3 = sqrt(f*f + f2*f2)
-          call do_horizontal_average(nx, ny, nz, nxloc, nyloc, nzloc, zs, f3, profile)
+          scratch = sqrt(f*f + f2*f2)
+          call do_horizontal_average(nx, ny, nz, nxloc, nyloc, nzloc, zs, scratch, profile)
           if (myrank == 0) then
             outname = trim(outdir)//'/'//trim(stem)//'_WS_HA_z.csv'
             call csv_profile(nz, trim(outname), 'z', z, profile)
@@ -1223,7 +1272,7 @@ contains
         call expand_terms(path, job%fields(i)%terms, job%fields(i)%nterms, lists, ncases, ierr)
         if (ierr /= 0) call abort_expand_error(ierr)
         do icase = 1, ncases
-          call assemble_terms_case(reader, job%fields(i)%terms, job%fields(i)%nterms, lists, icase, f)
+          call assemble_terms_case(reader, job%fields(i)%terms, job%fields(i)%nterms, lists, icase, f, scratch)
           call do_horizontal_average(nx, ny, nz, nxloc, nyloc, nzloc, zs, f, profile)
           if (myrank == 0) then
             stem = expr_output_stem_case(job%fields(i), lists, job%fields(i)%nterms, icase)
@@ -1245,14 +1294,14 @@ contains
     real(rk) :: dx, dy, dz, area_weight
     real(rk), allocatable, target :: x(:), y(:), z(:)
     real(rk), pointer :: coord(:)
-    real(rk), allocatable :: f(:,:,:), local_sum(:), global_sum(:), l2norm(:)
+    real(rk), allocatable :: f(:,:,:), scratch(:,:,:), local_sum(:), global_sum(:), l2norm(:)
     type(file_list_t), allocatable :: lists(:)
     character(len=:), allocatable :: outname, stem
 
     call reader%global_shape(nx, ny, nz)
     call reader%local_shape(nxloc, nyloc, nzloc)
     call reader%indices(xs, xe, ys, ye, zs, ze)
-    allocate(f(nxloc,nyloc,nzloc), x(nx), y(ny), z(nz))
+    allocate(f(nxloc,nyloc,nzloc), scratch(nxloc,nyloc,nzloc), x(nx), y(ny), z(nz))
     call create_grid(Lx, Ly, Lz, nx, ny, nz, x, y, z)
     dx = Lx/real(nx,rk); dy = Ly/real(ny,rk); dz = Lz/real(nz,rk)
 
@@ -1268,7 +1317,7 @@ contains
         ni = nz; coord => z; area_weight = dx*dy; profile_axis = 3
       end select
       do icase = 1, ncases
-        call assemble_terms_case(reader, job%rms(ip)%field%terms, job%rms(ip)%field%nterms, lists, icase, f)
+        call assemble_terms_case(reader, job%rms(ip)%field%terms, job%rms(ip)%field%nterms, lists, icase, f, scratch)
         allocate(local_sum(ni), global_sum(ni), l2norm(ni))
         local_sum = 0.0_rk
 
@@ -1338,13 +1387,13 @@ contains
     type(diag_job_t), intent(in) :: job
     integer :: nx, ny, nz, nxloc, nyloc, nzloc, ifield, ispec, ierr, icase, ncases
     real(rk), allocatable, target :: x(:), y(:), z(:)
-    real(rk), allocatable :: f(:,:,:)
+    real(rk), allocatable :: f(:,:,:), scratch(:,:,:)
     type(file_list_t), allocatable :: lists(:)
     character(len=:), allocatable :: stem
 
     call reader%global_shape(nx, ny, nz)
     call reader%local_shape(nxloc, nyloc, nzloc)
-    allocate(f(nxloc,nyloc,nzloc), x(nx), y(ny), z(nz))
+    allocate(f(nxloc,nyloc,nzloc), scratch(nxloc,nyloc,nzloc), x(nx), y(ny), z(nz))
     call create_grid(Lx, Ly, Lz, nx, ny, nz, x, y, z)
 
     do ifield = 1, job%nfields
@@ -1355,7 +1404,7 @@ contains
       call expand_terms(path, job%fields(ifield)%terms, job%fields(ifield)%nterms, lists, ncases, ierr)
       if (ierr /= 0) call abort_expand_error(ierr)
       do icase = 1, ncases
-        call assemble_terms_case(reader, job%fields(ifield)%terms, job%fields(ifield)%nterms, lists, icase, f)
+        call assemble_terms_case(reader, job%fields(ifield)%terms, job%fields(ifield)%nterms, lists, icase, f, scratch)
         stem = expr_output_stem_case(job%fields(ifield), lists, job%fields(ifield)%nterms, icase)
         do ispec = 1, job%nslices
           call process_slice_spec(reader, f, x, y, z, Lx, Ly, Lz, outdir, trim(stem), job%slices(ispec))
@@ -1473,13 +1522,15 @@ contains
     type(diag_job_t), intent(in) :: job
     integer :: nx, ny, nz, nxloc, nyloc, nzloc, icase, ncases, ncases_uw, ncases_vw, ierr
     real(rk), allocatable, target :: x(:), y(:), z(:)
-    real(rk), allocatable :: uw(:,:,:), vw(:,:,:), buffer(:,:,:)
+    real(rk), allocatable :: uw(:,:,:), vw(:,:,:), buffer(:,:,:), scratch(:,:,:), yscratch(:,:,:), zscratch(:,:,:)
     type(file_list_t), allocatable :: lists(:), uw_lists(:), vw_lists(:)
     character(len=:), allocatable :: stem
 
     call reader%global_shape(nx, ny, nz)
     call reader%local_shape(nxloc, nyloc, nzloc)
-    allocate(x(nx), y(ny), z(nz), buffer(nxloc,nyloc,nzloc))
+    allocate(x(nx), y(ny), z(nz), buffer(nxloc,nyloc,nzloc), scratch(nxloc,nyloc,nzloc), &
+      yscratch(reader%gpC%ysz(1), reader%gpC%ysz(2), reader%gpC%ysz(3)), &
+      zscratch(reader%gpC%zsz(1), reader%gpC%zsz(2), reader%gpC%zsz(3)))
     call create_grid(Lx, Ly, Lz, nx, ny, nz, x, y, z)
 
     select case(trim(lower(job%abl%method)))
@@ -1495,48 +1546,46 @@ contains
         call MPI_Abort(MPI_COMM_WORLD, 831, ierr)
       end if
       do icase = 1, ncases
-        call assemble_terms_case(reader, job%abl%uw%terms, job%abl%uw%nterms, uw_lists, icase, uw)
-        call assemble_terms_case(reader, job%abl%vw%terms, job%abl%vw%nterms, vw_lists, icase, vw)
-        buffer = sqrt(uw**2 + vw**2)
+        call assemble_terms_case(reader, job%abl%uw%terms, job%abl%uw%nterms, uw_lists, icase, uw, scratch)
+        call assemble_terms_case(reader, job%abl%vw%terms, job%abl%vw%nterms, vw_lists, icase, vw, scratch)
+        uw = sqrt(uw**2 + vw**2)
         if (ncases > 1) then
           stem = 'ABL_stress_'//trim(expr_output_stem_case(job%abl%uw, uw_lists, job%abl%uw%nterms, icase))
         else
           stem = 'ABL_stress'
         end if
-        call export_abl_threshold(reader, buffer, x, y, z, outdir, trim(stem), job%abl%threshold)
+        call export_abl_threshold(reader, uw, x, y, z, outdir, trim(stem), job%abl%threshold, yscratch, zscratch)
       end do
     case('inversion')
       call expand_terms(path, job%abl%theta%terms, job%abl%theta%nterms, lists, ncases, ierr)
       if (ierr /= 0) call abort_expand_error(ierr)
       do icase = 1, ncases
-        call assemble_terms_case(reader, job%abl%theta%terms, job%abl%theta%nterms, lists, icase, buffer)
-        if (ncases > 1) then
-          stem = 'ABL_inversion_'//trim(expr_output_stem_case(job%abl%theta, lists, job%abl%theta%nterms, icase))
-        else
-          stem = 'ABL_inversion'
-        end if
+        call assemble_terms_case(reader, job%abl%theta%terms, job%abl%theta%nterms, lists, icase, buffer, scratch)
+        stem = legacy_run_time_stem(lists(1)%names(merge(1, icase, lists(1)%n == 1)))
         call export_abl_inversion(reader, buffer, x, y, z, outdir, trim(stem), job%abl%lengthscale, &
-          job%abl%inversion_l0, job%abl%inversion_d0, job%abl%inversion_xi)
+          job%abl%inversion_l0, job%abl%inversion_d0, job%abl%inversion_xi, yscratch, zscratch)
       end do
     case default
       call message('ERROR: ABL method must be stress or inversion.')
     end select
   end subroutine run_abl
 
-  subroutine export_abl_threshold(reader, field, x, y, z, outdir, stem, threshold)
+  subroutine export_abl_threshold(reader, field, x, y, z, outdir, stem, threshold, ytmp, ztmp)
     class(FieldReader2Decomp), intent(inout) :: reader
     real(rk), intent(in) :: field(:,:,:), x(:), y(:), z(:), threshold
     character(*), intent(in) :: outdir, stem
-    real(rk), allocatable :: ytmp(:,:,:), ztmp(:,:,:), local(:,:), global(:,:)
+    real(rk), intent(inout) :: ytmp(:,:,:), ztmp(:,:,:)
+    real(rk), allocatable :: local(:,:), global(:,:)
     integer :: nx, ny, nz, ierr
     character(len=:), allocatable :: fname
 
     call reader%global_shape(nx, ny, nz)
     if (nz /= size(z)) call message('WARNING: ABL threshold z-grid length differs from global nz.')
-    allocate(ytmp(reader%gpC%ysz(1), reader%gpC%ysz(2), reader%gpC%ysz(3)))
-    allocate(ztmp(reader%gpC%zsz(1), reader%gpC%zsz(2), reader%gpC%zsz(3)))
     allocate(local(nx,ny), global(nx,ny))
     local = 0.0_rk; global = 0.0_rk
+    call require_shape3('ABL threshold x-pencil field', shape(field), reader%gpC%xsz)
+    call require_shape3('ABL threshold y-pencil scratch', shape(ytmp), reader%gpC%ysz)
+    call require_shape3('ABL threshold z-pencil scratch', shape(ztmp), reader%gpC%zsz)
     call transpose_x_to_y(field, ytmp, reader%gpC)
     call transpose_y_to_z(ytmp, ztmp, reader%gpC)
     call find_threshold_crossing_z(ztmp, z, &
@@ -1549,21 +1598,23 @@ contains
     end if
   end subroutine export_abl_threshold
 
-  subroutine export_abl_inversion(reader, theta, x, y, z, outdir, stem, lengthscale, l0, d0, xi)
+  subroutine export_abl_inversion(reader, theta, x, y, z, outdir, stem, lengthscale, l0, d0, xi, ytmp, ztmp)
     class(FieldReader2Decomp), intent(inout) :: reader
     real(rk), intent(in) :: theta(:,:,:), x(:), y(:), z(:), lengthscale
     real(rk), intent(in) :: l0, d0, xi
     character(*), intent(in) :: outdir, stem
     integer :: nx, ny, nz, ic, jc, ig, jg, ierr
-    real(rk), allocatable :: ytmp(:,:,:), ztmp(:,:,:), h0(:,:), h2(:,:), global(:,:)
+    real(rk), intent(inout) :: ytmp(:,:,:), ztmp(:,:,:)
+    real(rk), allocatable :: h0(:,:), h2(:,:), global(:,:)
     real(rk), allocatable :: tcol(:), z_m(:)
     type(rz_params) :: params
 
     call reader%global_shape(nx, ny, nz)
-    allocate(ytmp(reader%gpC%ysz(1), reader%gpC%ysz(2), reader%gpC%ysz(3)))
-    allocate(ztmp(reader%gpC%zsz(1), reader%gpC%zsz(2), reader%gpC%zsz(3)))
     allocate(h0(nx,ny), h2(nx,ny), global(nx,ny), tcol(nz), z_m(nz))
     h0 = 0.0_rk; h2 = 0.0_rk; z_m = z * lengthscale
+    call require_shape3('ABL inversion x-pencil theta', shape(theta), reader%gpC%xsz)
+    call require_shape3('ABL inversion y-pencil scratch', shape(ytmp), reader%gpC%ysz)
+    call require_shape3('ABL inversion z-pencil scratch', shape(ztmp), reader%gpC%zsz)
     call transpose_x_to_y(theta, ytmp, reader%gpC)
     call transpose_y_to_z(ytmp, ztmp, reader%gpC)
 
@@ -1572,8 +1623,12 @@ contains
         ig = reader%gpC%zst(1) + ic - 1
         jg = reader%gpC%zst(2) + jc - 1
         tcol = ztmp(ic,jc,:)
-        call fit_rz_profile(z_m, tcol, nz, l0, d0, params)
-        if ((params%status == 0 .or. params%status == 2) .and. params%sse < huge(1.0_rk)) then
+        call fit_rz_profile(z_m, tcol, nz, l0, d0, params, &
+          d_min    = 1.0e-6_rk,  &
+          ridge    = 1.0e-12_rk, &
+          max_iter = 1000,        &
+          tol      = 1.0e-10_rk)
+        if (params%status == 0) then
           h0(ig,jg) = params%l - xi * params%d
           h2(ig,jg) = params%l + xi * params%d
         end if
@@ -1582,117 +1637,284 @@ contains
 
     global = 0.0_rk
     call MPI_Reduce(h0, global, nx*ny, mpi_rk, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
-    if (myrank == 0) call export_slice_to_netcdf(trim(outdir)//'/'//trim(stem)//'_h0.nc', 'ABL_h0', global, x, y, 'x', 'y')
+    if (myrank == 0) call export_slice_to_netcdf(trim(outdir)//'/'//trim(stem)//'_INVH0.nc', 'INVH0', global, x, y, 'x', 'y')
     global = 0.0_rk
     call MPI_Reduce(h2, global, nx*ny, mpi_rk, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
-    if (myrank == 0) call export_slice_to_netcdf(trim(outdir)//'/'//trim(stem)//'_h2.nc', 'ABL_h2', global, x, y, 'x', 'y')
+    if (myrank == 0) call export_slice_to_netcdf(trim(outdir)//'/'//trim(stem)//'_INVH2.nc', 'INVH2', global, x, y, 'x', 'y')
   end subroutine export_abl_inversion
 
-  subroutine fit_rz_profile(z, t, n, l0, d0, params)
+  pure real(rk) function f_basis(x)
+    real(rk), intent(in) :: x
+    f_basis = 0.5_rk * (tanh(x) + 1.0_rk)
+  end function f_basis
+
+  pure real(rk) function log_2cosh_stable(x)
+    real(rk), intent(in) :: x
+    if (x >= 0.0_rk) then
+      log_2cosh_stable = x + log(1.0_rk + exp(-2.0_rk*x))
+    else
+      log_2cosh_stable = -x + log(1.0_rk + exp(2.0_rk*x))
+    end if
+  end function log_2cosh_stable
+
+  pure real(rk) function g_basis(x)
+    real(rk), intent(in) :: x
+    g_basis = 0.5_rk * (log_2cosh_stable(x) + x)
+  end function g_basis
+
+  subroutine fit_rz_profile(z, t, n, l0, d0, params, d_min, ridge, max_iter, tol)
     integer, intent(in) :: n
     real(rk), intent(in) :: z(n), t(n), l0, d0
     type(rz_params), intent(out) :: params
-    integer :: iter, i_best
-    real(rk) :: l, d, best, trial, step_l, step_d
+    real(rk), intent(in), optional :: d_min, ridge, tol
+    integer, intent(in), optional :: max_iter
 
-    l = l0
-    d = max(d0, 1.0e-6_rk)
-    step_l = max(0.05_rk * (maxval(z)-minval(z)), 1.0_rk)
-    step_d = max(0.10_rk * (maxval(z)-minval(z)), 1.0_rk)
-    best = rz_objective(z, t, n, l, d)
-    do iter = 1, 80
-      i_best = 0
-      trial = rz_objective(z, t, n, l + step_l, d)
-      if (trial < best) then; best = trial; l = l + step_l; i_best = 1; end if
-      trial = rz_objective(z, t, n, l - step_l, d)
-      if (trial < best) then; best = trial; l = l - step_l; i_best = 1; end if
-      trial = rz_objective(z, t, n, l, max(d + step_d, 1.0e-6_rk))
-      if (trial < best) then; best = trial; d = max(d + step_d, 1.0e-6_rk); i_best = 1; end if
-      trial = rz_objective(z, t, n, l, max(d - step_d, 1.0e-6_rk))
-      if (trial < best) then; best = trial; d = max(d - step_d, 1.0e-6_rk); i_best = 1; end if
-      if (i_best == 0) then
-        step_l = 0.5_rk * step_l
-        step_d = 0.5_rk * step_d
-      end if
-      if (max(step_l, step_d) < 1.0e-6_rk) exit
-    end do
-    best = rz_objective(z, t, n, l, d, params)
-    params%l = l
-    params%d = d
-    params%sse = best
-    if (max(step_l, step_d) < 1.0e-6_rk) then
-      params%status = 0
-    else
-      params%status = 2
-    end if
-  end subroutine fit_rz_profile
+    real(rk) :: dmin_loc, ridge_loc, tol_loc
+    integer :: max_iter_loc
+    real(rk) :: x(2,3), fval(3)
+    real(rk) :: centroid(2), xr(2), xe(2), xc(2)
+    real(rk) :: fr, fe, fc
+    real(rk) :: alpha, gamma, rho, sigma
+    real(rk) :: scale_l, scale_d, z_range, simplex_size
+    integer :: iter, i_best, i_worst, i_mid, stat
 
-  real(rk) function rz_objective(z, t, n, l, d, params)
-    integer, intent(in) :: n
-    real(rk), intent(in) :: z(n), t(n), l, d
-    type(rz_params), intent(inout), optional :: params
-    real(rk) :: A(3,3), bvec(3), sol(3), x, f, g, pred
-    integer :: i, status
-    A = 0.0_rk; bvec = 0.0_rk
-    do i = 1, n
-      x = (z(i) - l) / d
-      f = 0.5_rk * (tanh(x) + 1.0_rk)
-      g = 0.5_rk * (log(2.0_rk*cosh(max(min(x,50.0_rk),-50.0_rk))) + x)
-      A(1,1)=A(1,1)+1.0_rk; A(1,2)=A(1,2)+f; A(1,3)=A(1,3)+g
-      A(2,2)=A(2,2)+f*f; A(2,3)=A(2,3)+f*g; A(3,3)=A(3,3)+g*g
-      bvec(1)=bvec(1)+t(i); bvec(2)=bvec(2)+t(i)*f; bvec(3)=bvec(3)+t(i)*g
-    end do
-    A(2,1)=A(1,2); A(3,1)=A(1,3); A(3,2)=A(2,3)
-    call solve_3x3(A, bvec, sol, status)
-    if (status /= 0) then
-      rz_objective = huge(1.0_rk)
+    dmin_loc = 1.0e-6_rk
+    ridge_loc = 0.0_rk
+    max_iter_loc = 500
+    tol_loc = 1.0e-8_rk
+    if (present(d_min)) dmin_loc = d_min
+    if (present(ridge)) ridge_loc = ridge
+    if (present(max_iter)) max_iter_loc = max_iter
+    if (present(tol)) tol_loc = tol
+
+    alpha = 1.0_rk
+    gamma = 2.0_rk
+    rho = 0.5_rk
+    sigma = 0.5_rk
+
+    z_range = maxval(z) - minval(z)
+    if (z_range <= 0.0_rk) then
+      params%status = -2
       return
     end if
-    rz_objective = 0.0_rk
-    do i = 1, n
-      x = (z(i) - l) / d
-      f = 0.5_rk * (tanh(x) + 1.0_rk)
-      g = 0.5_rk * (log(2.0_rk*cosh(max(min(x,50.0_rk),-50.0_rk))) + x)
-      pred = sol(1) + sol(2)*f + sol(3)*g
-      rz_objective = rz_objective + (pred - t(i))**2
+    scale_l = max(10.0_rk * dmin_loc, 0.05_rk * z_range)
+    scale_d = max(10.0_rk * dmin_loc, 0.10_rk * z_range)
+
+    x(:,1) = [l0, max(d0, dmin_loc)]
+    x(:,2) = [l0 + scale_l, max(d0, dmin_loc)]
+    x(:,3) = [l0, max(d0 + scale_d, dmin_loc)]
+
+    do i_best = 1, 3
+      fval(i_best) = objective(z, t, n, x(1,i_best), x(2,i_best), dmin_loc, ridge_loc, stat)
     end do
-    if (present(params)) then
-      params%tm = sol(1); params%a = sol(2); params%b = sol(3)
+
+    do iter = 1, max_iter_loc
+      call order_simplex(fval, i_best, i_mid, i_worst)
+      simplex_size = maxval(abs(x - spread(x(:,i_best), 2, 3)))
+      if (maxval(abs(fval - fval(i_best))) < tol_loc * (1.0_rk + abs(fval(i_best)))) exit
+      if (simplex_size < tol_loc * max(1.0_rk, z_range)) exit
+
+      centroid = 0.5_rk * (x(:,i_best) + x(:,i_mid))
+      xr = centroid + alpha * (centroid - x(:,i_worst))
+      xr(2) = max(xr(2), dmin_loc)
+      fr = objective(z, t, n, xr(1), xr(2), dmin_loc, ridge_loc, stat)
+
+      if (fr < fval(i_best)) then
+        xe = centroid + gamma * (xr - centroid)
+        xe(2) = max(xe(2), dmin_loc)
+        fe = objective(z, t, n, xe(1), xe(2), dmin_loc, ridge_loc, stat)
+        if (fe < fr) then
+          x(:,i_worst) = xe
+          fval(i_worst) = fe
+        else
+          x(:,i_worst) = xr
+          fval(i_worst) = fr
+        end if
+      else if (fr < fval(i_mid)) then
+        x(:,i_worst) = xr
+        fval(i_worst) = fr
+      else
+        if (fr < fval(i_worst)) then
+          xc = centroid + rho * (xr - centroid)
+        else
+          xc = centroid + rho * (x(:,i_worst) - centroid)
+        end if
+        xc(2) = max(xc(2), dmin_loc)
+        fc = objective(z, t, n, xc(1), xc(2), dmin_loc, ridge_loc, stat)
+        if (fc < fval(i_worst)) then
+          x(:,i_worst) = xc
+          fval(i_worst) = fc
+        else
+          x(:,i_mid) = x(:,i_best) + sigma * (x(:,i_mid) - x(:,i_best))
+          x(:,i_worst) = x(:,i_best) + sigma * (x(:,i_worst) - x(:,i_best))
+          x(2,i_mid) = max(x(2,i_mid), dmin_loc)
+          x(2,i_worst) = max(x(2,i_worst), dmin_loc)
+          fval(i_mid) = objective(z, t, n, x(1,i_mid), x(2,i_mid), dmin_loc, ridge_loc, stat)
+          fval(i_worst) = objective(z, t, n, x(1,i_worst), x(2,i_worst), dmin_loc, ridge_loc, stat)
+        end if
+      end if
+    end do
+
+    call order_simplex(fval, i_best, i_mid, i_worst)
+    params%l = x(1,i_best)
+    params%d = x(2,i_best)
+    params%sse = fval(i_best)
+    call solve_tmab(z, t, n, params%l, params%d, ridge_loc, params%tm, params%a, params%b, stat)
+    params%status = stat
+    if (iter > max_iter_loc) params%status = 1
+  end subroutine fit_rz_profile
+
+  real(rk) function objective(z, t, n, l, d, d_min, ridge, status)
+    integer, intent(in) :: n
+    real(rk), intent(in) :: z(n), t(n), l, d, d_min, ridge
+    integer, intent(out) :: status
+    real(rk) :: tm, a, b, eta, t_fit, res
+    integer :: i
+
+    if (d <= d_min) then
+      objective = huge(1.0_rk)
+      status = -1
+      return
     end if
-  end function rz_objective
+    call solve_tmab(z, t, n, l, d, ridge, tm, a, b, status)
+    if (status /= 0) then
+      objective = huge(1.0_rk)
+      return
+    end if
+
+    objective = 0.0_rk
+    do i = 1, n
+      eta = (z(i) - l) / d
+      t_fit = tm + a * f_basis(eta) + b * g_basis(eta)
+      res = t(i) - t_fit
+      objective = objective + res * res
+    end do
+  end function objective
+
+  subroutine solve_tmab(z, t, n, l, d, ridge, tm, a, b, status)
+    integer, intent(in) :: n
+    real(rk), intent(in) :: z(n), t(n), l, d, ridge
+    real(rk), intent(out) :: tm, a, b
+    integer, intent(out) :: status
+    real(rk) :: M(3,3), rhs(3), sol(3)
+    real(rk) :: eta, fv, gv
+    real(rk) :: S1, Sf, Sg, Sff, Sgg, Sfg, St, Sft, Sgt
+    integer :: i
+
+    S1 = real(n, rk)
+    Sf = 0.0_rk; Sg = 0.0_rk
+    Sff = 0.0_rk; Sgg = 0.0_rk; Sfg = 0.0_rk
+    St = 0.0_rk; Sft = 0.0_rk; Sgt = 0.0_rk
+    do i = 1, n
+      eta = (z(i) - l) / d
+      fv = f_basis(eta)
+      gv = g_basis(eta)
+      Sf = Sf + fv
+      Sg = Sg + gv
+      Sff = Sff + fv * fv
+      Sgg = Sgg + gv * gv
+      Sfg = Sfg + fv * gv
+      St = St + t(i)
+      Sft = Sft + fv * t(i)
+      Sgt = Sgt + gv * t(i)
+    end do
+
+    M(1,:) = [S1, Sf, Sg]
+    M(2,:) = [Sf, Sff, Sfg]
+    M(3,:) = [Sg, Sfg, Sgg]
+    if (ridge > 0.0_rk) then
+      M(1,1) = M(1,1) + ridge
+      M(2,2) = M(2,2) + ridge
+      M(3,3) = M(3,3) + ridge
+    end if
+    rhs = [St, Sft, Sgt]
+
+    call solve_3x3(M, rhs, sol, status)
+    if (status == 0) then
+      tm = sol(1)
+      a = sol(2)
+      b = sol(3)
+    else
+      tm = 0.0_rk
+      a = 0.0_rk
+      b = 0.0_rk
+    end if
+  end subroutine solve_tmab
 
   subroutine solve_3x3(Ain, bin, x, status)
-    real(rk), intent(in) :: Ain(3,3), bin(3)
+    real(rk), intent(in)  :: Ain(3,3), bin(3)
     real(rk), intent(out) :: x(3)
-    integer, intent(out) :: status
-    real(rk) :: A(3,4), factor, pivot, pivot_tol
+    integer, intent(out)  :: status
+    real(rk) :: A(3,3), b(3)
+    real(rk) :: factor, tmp, pivot_abs
     integer :: i, j, k, p
-    A(:,1:3) = Ain; A(:,4) = bin
-    pivot_tol = 1.0e-10_rk * max(1.0_rk, maxval(abs(Ain)))
+
+    A = Ain
+    b = bin
     status = 0
-    do k = 1, 3
+    do k = 1, 2
       p = k
+      pivot_abs = abs(A(k,k))
       do i = k+1, 3
-        if (abs(A(i,k)) > abs(A(p,k))) p = i
+        if (abs(A(i,k)) > pivot_abs) then
+          p = i
+          pivot_abs = abs(A(i,k))
+        end if
       end do
-      if (abs(A(p,k)) <= pivot_tol) then
-        status = 1
+      if (pivot_abs < 1.0e-14_rk) then
+        status = -1
         x = 0.0_rk
         return
       end if
-      if (p /= k) A([k,p],:) = A([p,k],:)
-      pivot = A(k,k)
-      A(k,k:4) = A(k,k:4) / pivot
-      do i = 1, 3
-        if (i == k) cycle
-        factor = A(i,k)
-        do j = k, 4
+      if (p /= k) then
+        do j = k, 3
+          tmp = A(k,j)
+          A(k,j) = A(p,j)
+          A(p,j) = tmp
+        end do
+        tmp = b(k)
+        b(k) = b(p)
+        b(p) = tmp
+      end if
+      do i = k+1, 3
+        factor = A(i,k) / A(k,k)
+        A(i,k) = 0.0_rk
+        do j = k+1, 3
           A(i,j) = A(i,j) - factor * A(k,j)
         end do
+        b(i) = b(i) - factor * b(k)
       end do
     end do
-    x = A(:,4)
+
+    if (abs(A(3,3)) < 1.0e-14_rk) then
+      status = -1
+      x = 0.0_rk
+      return
+    end if
+    x(3) = b(3) / A(3,3)
+    x(2) = (b(2) - A(2,3) * x(3)) / A(2,2)
+    x(1) = (b(1) - A(1,2) * x(2) - A(1,3) * x(3)) / A(1,1)
   end subroutine solve_3x3
+
+  subroutine order_simplex(fval, i_best, i_mid, i_worst)
+    real(rk), intent(in) :: fval(3)
+    integer, intent(out) :: i_best, i_mid, i_worst
+    integer :: idx(3), i, j, tmp
+
+    idx = [1, 2, 3]
+    do i = 1, 2
+      do j = i+1, 3
+        if (fval(idx(j)) < fval(idx(i))) then
+          tmp = idx(i)
+          idx(i) = idx(j)
+          idx(j) = tmp
+        end if
+      end do
+    end do
+    i_best = idx(1)
+    i_mid = idx(2)
+    i_worst = idx(3)
+  end subroutine order_simplex
 
   subroutine find_threshold_crossing_z(field, z, zcross, threshold, missing_value)
     real(rk), intent(in) :: field(:,:,:), z(:), threshold, missing_value
@@ -1729,6 +1951,7 @@ contains
     character(*), intent(in) :: filename, axis
     real(rk), intent(in) :: coord(n), profile(n)
     integer :: u, i
+    call message('Writing file: '//trim(filename))
     open(newunit=u, file=trim(filename), status='replace', action='write')
     write(u,'(A)') trim(axis)//',profile'
     do i = 1, n
@@ -1743,6 +1966,7 @@ contains
     real(rk), intent(in) :: coord(n), profile(n)
     type(rms_spec_t), intent(in) :: item
     integer :: u, i
+    call message('Writing file: '//trim(filename))
     open(newunit=u, file=trim(filename), status='replace', action='write')
     write(u,'(A)') trim(axis)//',l2_norm'
     do i = 1, n
@@ -1757,6 +1981,7 @@ contains
     real(rk), intent(in) :: slice(:,:), x1(:), x2(:)
     integer :: ncid, dimid_x1, dimid_x2, varid_x1, varid_x2, varid_f, ierr
     integer :: dimids_f(2)
+    call message('Writing file: '//trim(fname))
     ierr = nf90_create(trim(fname), ior(NF90_CLOBBER, NF90_NETCDF4), ncid)
     call nc_check(ierr, 'nf90_create')
     ierr = nf90_def_dim(ncid, trim(x1_name), size(x1), dimid_x1); call nc_check(ierr, 'def_dim x1')
@@ -1861,20 +2086,34 @@ contains
     s = trim(tmp)
   end function int_to_string
 
+  subroutine require_shape3(label, actual, expected)
+    character(*), intent(in) :: label
+    integer, intent(in) :: actual(3), expected(3)
+    integer :: ierr
+    if (all(actual == expected)) return
+    call message('ERROR: '//trim(label)//' shape is '//int_to_string(actual(1))//' x '// &
+      int_to_string(actual(2))//' x '//int_to_string(actual(3))//'; expected '// &
+      int_to_string(expected(1))//' x '//int_to_string(expected(2))//' x '//int_to_string(expected(3)))
+    call MPI_Abort(MPI_COMM_WORLD, 910, ierr)
+  end subroutine require_shape3
+
   subroutine frd_init(this, nx, ny, nz)
     class(FieldReader2Decomp), intent(inout) :: this
     integer, intent(in) :: nx, ny, nz
     if (this%is_init) return
     this%nx = nx; this%ny = ny; this%nz = nz
-    call this%choose_proc_grid_(nprocs, this%p_row, this%p_col)
+    call this%choose_proc_grid_(nprocs, nx, ny, this%p_row, this%p_col)
+    if (myrank == 0) then
+      call message('FRD_INIT: proc grid = '//int_to_string(this%p_row)//' x '//int_to_string(this%p_col))
+    end if
     call decomp_2d_init(nx, ny, nz, this%p_row, this%p_col)
     call decomp_info_init(nx, ny, nz, this%gpC)
-    this%xs=xstart(1); this%xe=xend(1)
-    this%ys=ystart(1); this%ye=yend(1)
-    this%zs=zstart(1); this%ze=zend(1)
-    this%nxloc=this%xe-this%xs+1
-    this%nyloc=this%ye-this%ys+1
-    this%nzloc=this%ze-this%zs+1
+    this%xs=this%gpC%xst(1); this%xe=this%gpC%xen(1)
+    this%ys=this%gpC%xst(2); this%ye=this%gpC%xen(2)
+    this%zs=this%gpC%xst(3); this%ze=this%gpC%xen(3)
+    this%nxloc=this%gpC%xsz(1)
+    this%nyloc=this%gpC%xsz(2)
+    this%nzloc=this%gpC%xsz(3)
     this%is_init = .true.
   end subroutine frd_init
 
@@ -1924,18 +2163,26 @@ contains
     end if
   end subroutine frd_finalize
 
-  subroutine frd_choose_proc_grid(nproc, p_row, p_col)
-    integer, intent(in) :: nproc
+  subroutine frd_choose_proc_grid(nproc, nx, ny, p_row, p_col)
+    integer, intent(in) :: nproc, nx, ny
     integer, intent(out) :: p_row, p_col
-    integer :: r
-    p_row = 1; p_col = nproc
-    do r = nint(sqrt(real(nproc, rk))), 1, -1
-      if (mod(nproc, r) == 0) then
-        p_row = r
-        p_col = nproc / r
-        exit
+    integer :: r, best_row, best_col
+    real(rk) :: best_score, score
+
+    best_score = huge(1.0_rk)
+    best_row = 1
+    best_col = nproc
+    do r = 1, nproc
+      if (mod(nproc, r) /= 0) cycle
+      score = abs(real(nx, rk) / real(max(1, ny), rk) - real(nproc / r, rk) / real(r, rk))
+      if (score < best_score) then
+        best_score = score
+        best_row = r
+        best_col = nproc / r
       end if
     end do
+    p_row = best_row
+    p_col = best_col
   end subroutine frd_choose_proc_grid
 
 end module MPIR3D_Lean
