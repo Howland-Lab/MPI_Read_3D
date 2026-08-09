@@ -27,6 +27,9 @@ case "${platform}:${toolchain}" in
   anvil:gcc)
     setup_file="setup/SetupEnv_Anvil_gcc.sh"
     ;;
+  anvil:gcc_debug)
+    setup_file="setup/SetupEnv_Anvil_gcc_debug.sh"
+    ;;
   anvil:impi)
     setup_file="setup/SetupEnv_Anvil_impi.sh"
     ;;
@@ -89,17 +92,20 @@ common_flags=("-O3" "-g")
 case "${COMPILER_ID:-}" in
   GNU)
     fcflags=("${common_flags[@]}" "-Wall" "-fopenmp" "-ffree-line-length-none" "-fallow-argument-mismatch")
+    mod_flags=("-J${build_dir}")
     ;;
   Intel)
     fcflags=("${common_flags[@]}" "-traceback" "-warn" "all" "-qopenmp")
+    mod_flags=("-module" "${build_dir}")
     ;;
   *)
     fcflags=("${common_flags[@]}")
+    mod_flags=("-J${build_dir}")
     ;;
 esac
 
 "${FC}" "${fcflags[@]}" \
-  -J"${build_dir}" \
+  "${mod_flags[@]}" \
   -I"${DECOMP_PATH}/include" $(nf-config --fflags) \
   "${source_file}" \
   -L"${DECOMP_PATH}/lib" -l2decomp_fft \
