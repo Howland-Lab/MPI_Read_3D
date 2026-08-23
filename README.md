@@ -91,6 +91,7 @@ The current lean drivers are:
 ha      horizontal average
 slice   2D slices and integrated slices
 rms     cross-plane L2 norm profiles
+profile cross-plane linear average profiles
 abl     ABL height diagnostics
 ```
 
@@ -172,6 +173,48 @@ bounds = *,*,*,*,*,*
 
 The `rms` driver exports `sqrt(integral f**2 dA)`, a cross-plane L2 norm. Area normalization to form RMS is done offline.
 
+The `rms` driver can also subtract a reference field before computing the
+cross-plane L2 norm:
+
+```text
+rms {
+  name = budget_combo_delta
+  expr {
+    (1.0)(file_a.s3D)
+  + (-1.0)(file_b.s3D)
+  }
+  axis = x
+  bounds = *,*,23.8,134.93,*,*
+  subtract_reference = true
+  ref_bounds = 0.0,20.0
+}
+```
+
+`ref_bounds` is a two-value interval along the selected `axis`. For `axis = x`,
+the reference is `f_ref(y,z)`, computed by averaging `f(x,y,z)` over the
+selected `x` interval while respecting the cross-plane parts of `bounds`.
+The output filename uses `_delta_rms_`, for example
+`budget_combo_delta_delta_rms_x.csv`.
+
+The `profile` driver computes linear cross-plane averages with the same
+expression, axis, and bounds syntax as `rms`. For example, `axis = x` writes an
+x profile of the bounded y-z average:
+
+```text
+driver = profile
+
+profile {
+  name = u_yz_avg
+  expr {
+    (1.0)(Run05_uVel_t000900.out)
+  }
+  axis = x
+  bounds = *,*,10.0,45.0,0.0,55.55555556
+}
+```
+
+The output is named like `u_yz_avg_avg_x.csv` and contains `x,average`.
+
 ## Examples
 
 Copy and edit the templates in `examples/`:
@@ -185,6 +228,8 @@ examples/slice_input.dat
 examples/slice_map.diag
 examples/rms_input.dat
 examples/rms_map.diag
+examples/profile_input.dat
+examples/profile_map.diag
 examples/abl_input.dat
 examples/abl_stress_map.diag
 examples/abl_inversion_map.diag

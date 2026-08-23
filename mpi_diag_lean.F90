@@ -88,6 +88,10 @@ module MPIR3D_Lean
     real(rk) :: bounds_max(3) = [ huge(1.0_rk),  huge(1.0_rk),  huge(1.0_rk)]
     logical :: has_min(3) = [.false., .false., .false.]
     logical :: has_max(3) = [.false., .false., .false.]
+    logical :: subtract_reference = .false.
+    logical :: has_ref_bounds = .false.
+    real(rk) :: ref_min = -huge(1.0_rk)
+    real(rk) :: ref_max =  huge(1.0_rk)
   end type rms_spec_t
 
   type :: abl_spec_t
@@ -120,6 +124,8 @@ module MPIR3D_Lean
     type(slice_spec_t), allocatable :: slices(:)
     integer :: nrms = 0
     type(rms_spec_t), allocatable :: rms(:)
+    integer :: nprofiles = 0
+    type(rms_spec_t), allocatable :: profiles(:)
     type(abl_spec_t) :: abl
   end type diag_job_t
 
@@ -398,6 +404,22 @@ contains
     call move_alloc(tmp, rms)
     nrms = nrms + 1
   end subroutine append_rms
+
+  subroutine append_profile(profiles, nprofiles, item)
+    type(rms_spec_t), allocatable, intent(inout) :: profiles(:)
+    integer, intent(inout) :: nprofiles
+    type(rms_spec_t), intent(in) :: item
+    type(rms_spec_t), allocatable :: tmp(:)
+    integer :: i
+    if (.not. allocated(profiles)) allocate(profiles(0))
+    allocate(tmp(nprofiles + 1))
+    do i = 1, nprofiles
+      tmp(i) = profiles(i)
+    end do
+    tmp(nprofiles + 1) = item
+    call move_alloc(tmp, profiles)
+    nprofiles = nprofiles + 1
+  end subroutine append_profile
 
   subroutine append_term_list(terms, nterms, coeff, filename)
     type(field_term_t), allocatable, intent(inout) :: terms(:)
@@ -753,11 +775,12 @@ contains
     character(len=str_len) :: line, clean, low
 
     ierr = 0
-    job%nfields = 0; job%nslices = 0; job%nrms = 0
+    job%nfields = 0; job%nslices = 0; job%nrms = 0; job%nprofiles = 0
     if (allocated(job%fields)) deallocate(job%fields)
     if (allocated(job%slices)) deallocate(job%slices)
     if (allocated(job%rms)) deallocate(job%rms)
-    allocate(job%fields(0), job%slices(0), job%rms(0))
+    if (allocated(job%profiles)) deallocate(job%profiles)
+    allocate(job%fields(0), job%slices(0), job%rms(0), job%profiles(0))
 
     open(newunit=unit, file=filename, status='old', action='read', iostat=ios)
     if (ios /= 0) then
@@ -780,6 +803,8 @@ contains
         call read_slice_block(unit, job, ierr)
       else if (key_is(low, 'rms')) then
         call read_rms_block(unit, job, ierr)
+      else if (key_is(low, 'profile')) then
+        call read_profile_block(unit, job, ierr)
       else if (key_is(low, 'abl')) then
         call read_abl_block(unit, job, ierr)
       end if
@@ -986,6 +1011,14 @@ contains
         val = value_after_equals(clean)
         call parse_bounds_csv(trim(val), item, ierr)
         if (ierr /= 0) return
+      else if (key_is(low, 'subtract_reference')) then
+        val = value_after_equals(clean)
+        call parse_logical_value(trim(val), item%subtract_reference, ierr)
+        if (ierr /= 0) return
+      else if (key_is(low, 'ref_bounds')) then
+        val = value_after_equals(clean)
+        call parse_ref_bounds_csv(trim(val), item, ierr)
+        if (ierr /= 0) return
       end if
     end do
 
@@ -997,8 +1030,68 @@ contains
       ierr = 302
       return
     end if
+    if (item%subtract_reference .and. .not. item%has_ref_bounds) then
+      ierr = 303
+      return
+    end if
     call append_rms(job%rms, job%nrms, item)
   end subroutine read_rms_block
+
+  subroutine read_profile_block(unit, job, ierr)
+    integer, intent(in) :: unit
+    type(diag_job_t), intent(inout) :: job
+    integer, intent(out) :: ierr
+    character(len=str_len) :: line, clean, low, val, expr_text, name
+    integer :: ios
+    type(rms_spec_t) :: item
+
+    ierr = 0
+    name = ''
+    item%axis = 'z'
+
+    do
+      read(unit, '(A)', iostat=ios) line
+      if (ios /= 0) then
+        ierr = ios
+        return
+      end if
+      clean = adjustl(trim(strip_comments(line)))
+      if (len_trim(clean) == 0) cycle
+      low = lower(clean)
+      if (clean(1:1) == '}') exit
+
+      if (key_is(low, 'name')) then
+        name = trim(value_after_equals(clean))
+      else if (key_is(low, 'expr')) then
+        if (index(clean, '{') > 0) then
+          call read_expr_body(unit, expr_text, ierr)
+        else
+          call read_braced_expr(unit, expr_text, ierr)
+        end if
+        if (ierr /= 0) return
+        call parse_field_expr(trim(expr_text), trim(name), item%field, ierr)
+        if (ierr /= 0) return
+      else if (key_is(low, 'axis')) then
+        val = adjustl(trim(value_after_equals(clean)))
+        val = lower(val)
+        item%axis = val(1:1)
+      else if (key_is(low, 'bounds')) then
+        val = value_after_equals(clean)
+        call parse_bounds_csv(trim(val), item, ierr)
+        if (ierr /= 0) return
+      end if
+    end do
+
+    if (item%field%nterms <= 0) then
+      ierr = 311
+      return
+    end if
+    if (.not. any(item%axis == ['x','y','z'])) then
+      ierr = 312
+      return
+    end if
+    call append_profile(job%profiles, job%nprofiles, item)
+  end subroutine read_profile_block
 
   subroutine read_abl_block(unit, job, ierr)
     integer, intent(in) :: unit
@@ -1169,12 +1262,80 @@ contains
     end do
   end subroutine parse_bounds_csv
 
+  subroutine parse_ref_bounds_csv(line, item, ierr)
+    character(*), intent(in) :: line
+    type(rms_spec_t), intent(inout) :: item
+    integer, intent(out) :: ierr
+    character(len=str_len) :: tmp, token
+    real(rk) :: value
+    integer :: i, start, ntok
+
+    ierr = 0
+    item%ref_min = -huge(1.0_rk)
+    item%ref_max =  huge(1.0_rk)
+    item%has_ref_bounds = .true.
+    tmp = trim(line)
+    start = 1
+    ntok = 0
+    do i = 1, len_trim(tmp) + 1
+      if (i > len_trim(tmp) .or. tmp(i:i) == ',') then
+        token = adjustl(trim(tmp(start:i-1)))
+        if (len_trim(token) > 0) then
+          ntok = ntok + 1
+          if (ntok > 2) then
+            ierr = 304
+            return
+          end if
+          if (trim(token) /= '*') then
+            read(token, *, iostat=ierr) value
+            if (ierr /= 0) return
+            if (ntok == 1) then
+              item%ref_min = value
+            else
+              item%ref_max = value
+            end if
+          end if
+        end if
+        start = i + 1
+      end if
+    end do
+    if (ntok /= 2) then
+      ierr = 304
+      return
+    end if
+    if (item%ref_min > item%ref_max) ierr = 305
+  end subroutine parse_ref_bounds_csv
+
+  subroutine parse_logical_value(text, value, ierr)
+    character(*), intent(in) :: text
+    logical, intent(out) :: value
+    integer, intent(out) :: ierr
+    character(len=str_len) :: val
+
+    ierr = 0
+    val = trim(lower(adjustl(text)))
+    select case(trim(val))
+    case('true', 't', '.true.', '1', 'yes', 'y', 'on')
+      value = .true.
+    case('false', 'f', '.false.', '0', 'no', 'n', 'off')
+      value = .false.
+    case default
+      ierr = 306
+    end select
+  end subroutine parse_logical_value
+
   pure logical function coord_in_bounds(coord, item, iax)
     real(rk), intent(in) :: coord
     type(rms_spec_t), intent(in) :: item
     integer, intent(in) :: iax
     coord_in_bounds = coord >= item%bounds_min(iax) .and. coord <= item%bounds_max(iax)
   end function coord_in_bounds
+
+  pure logical function coord_in_ref_bounds(coord, item)
+    real(rk), intent(in) :: coord
+    type(rms_spec_t), intent(in) :: item
+    coord_in_ref_bounds = coord >= item%ref_min .and. coord <= item%ref_max
+  end function coord_in_ref_bounds
 
   subroutine create_grid(Lx, Ly, Lz, nx, ny, nz, x, y, z)
     real(rk), intent(in) :: Lx, Ly, Lz
@@ -1291,12 +1452,14 @@ contains
     type(diag_job_t), intent(in) :: job
     integer :: nx, ny, nz, nxloc, nyloc, nzloc, xs, xe, ys, ye, zs, ze
     integer :: ip, i, j, k, ig, jg, kg, ni, profile_axis, ierr, icase, ncases
-    real(rk) :: dx, dy, dz, area_weight
+    integer :: ref_size, ref_idx
+    real(rk) :: dx, dy, dz, area_weight, field_value
     real(rk), allocatable, target :: x(:), y(:), z(:)
     real(rk), pointer :: coord(:)
     real(rk), allocatable :: f(:,:,:), scratch(:,:,:), local_sum(:), global_sum(:), l2norm(:)
+    real(rk), allocatable :: local_ref_sum(:), global_ref_sum(:), local_ref_count(:), global_ref_count(:), ref(:)
     type(file_list_t), allocatable :: lists(:)
-    character(len=:), allocatable :: outname, stem
+    character(len=:), allocatable :: outname, stem, rms_label
 
     call reader%global_shape(nx, ny, nz)
     call reader%local_shape(nxloc, nyloc, nzloc)
@@ -1318,6 +1481,85 @@ contains
       end select
       do icase = 1, ncases
         call assemble_terms_case(reader, job%rms(ip)%field%terms, job%rms(ip)%field%nterms, lists, icase, f, scratch)
+        if (job%rms(ip)%subtract_reference) then
+          select case(job%rms(ip)%axis)
+          case('x')
+            ref_size = ny * nz
+          case('y')
+            ref_size = nx * nz
+          case default
+            ref_size = nx * ny
+          end select
+          allocate(local_ref_sum(ref_size), global_ref_sum(ref_size), &
+            local_ref_count(ref_size), global_ref_count(ref_size), ref(ref_size))
+          local_ref_sum = 0.0_rk
+          local_ref_count = 0.0_rk
+
+          select case(job%rms(ip)%axis)
+          case('x')
+            do i = 1, nxloc
+              ig = xs + i - 1
+              if (.not. coord_in_ref_bounds(x(ig), job%rms(ip))) cycle
+              do j = 1, nyloc
+                jg = ys + j - 1
+                if (.not. coord_in_bounds(y(jg), job%rms(ip), 2)) cycle
+                do k = 1, nzloc
+                  kg = zs + k - 1
+                  if (.not. coord_in_bounds(z(kg), job%rms(ip), 3)) cycle
+                  ref_idx = (kg - 1) * ny + jg
+                  local_ref_sum(ref_idx) = local_ref_sum(ref_idx) + f(i,j,k)
+                  local_ref_count(ref_idx) = local_ref_count(ref_idx) + 1.0_rk
+                end do
+              end do
+            end do
+          case('y')
+            do j = 1, nyloc
+              jg = ys + j - 1
+              if (.not. coord_in_ref_bounds(y(jg), job%rms(ip))) cycle
+              do i = 1, nxloc
+                ig = xs + i - 1
+                if (.not. coord_in_bounds(x(ig), job%rms(ip), 1)) cycle
+                do k = 1, nzloc
+                  kg = zs + k - 1
+                  if (.not. coord_in_bounds(z(kg), job%rms(ip), 3)) cycle
+                  ref_idx = (kg - 1) * nx + ig
+                  local_ref_sum(ref_idx) = local_ref_sum(ref_idx) + f(i,j,k)
+                  local_ref_count(ref_idx) = local_ref_count(ref_idx) + 1.0_rk
+                end do
+              end do
+            end do
+          case default
+            do k = 1, nzloc
+              kg = zs + k - 1
+              if (.not. coord_in_ref_bounds(z(kg), job%rms(ip))) cycle
+              do i = 1, nxloc
+                ig = xs + i - 1
+                if (.not. coord_in_bounds(x(ig), job%rms(ip), 1)) cycle
+                do j = 1, nyloc
+                  jg = ys + j - 1
+                  if (.not. coord_in_bounds(y(jg), job%rms(ip), 2)) cycle
+                  ref_idx = (jg - 1) * nx + ig
+                  local_ref_sum(ref_idx) = local_ref_sum(ref_idx) + f(i,j,k)
+                  local_ref_count(ref_idx) = local_ref_count(ref_idx) + 1.0_rk
+                end do
+              end do
+            end do
+          end select
+
+          call MPI_Allreduce(local_ref_sum, global_ref_sum, ref_size, mpi_rk, MPI_SUM, MPI_COMM_WORLD, ierr)
+          call MPI_Allreduce(local_ref_count, global_ref_count, ref_size, mpi_rk, MPI_SUM, MPI_COMM_WORLD, ierr)
+          if (maxval(global_ref_count) <= 0.0_rk) then
+            call message('ERROR: subtract_reference ref_bounds did not select any cells.')
+            call MPI_Abort(MPI_COMM_WORLD, 307, ierr)
+          end if
+          ref = 0.0_rk
+          do ref_idx = 1, ref_size
+            if (global_ref_count(ref_idx) > 0.0_rk) then
+              ref(ref_idx) = global_ref_sum(ref_idx) / global_ref_count(ref_idx)
+            end if
+          end do
+        end if
+
         allocate(local_sum(ni), global_sum(ni), l2norm(ni))
         local_sum = 0.0_rk
 
@@ -1332,7 +1574,12 @@ contains
               do k = 1, nzloc
                 kg = zs + k - 1
                 if (.not. coord_in_bounds(z(kg), job%rms(ip), 3)) cycle
-                local_sum(ig) = local_sum(ig) + f(i,j,k)**2 * area_weight
+                field_value = f(i,j,k)
+                if (job%rms(ip)%subtract_reference) then
+                  ref_idx = (kg - 1) * ny + jg
+                  field_value = field_value - ref(ref_idx)
+                end if
+                local_sum(ig) = local_sum(ig) + field_value**2 * area_weight
               end do
             end do
           end do
@@ -1346,7 +1593,12 @@ contains
               do k = 1, nzloc
                 kg = zs + k - 1
                 if (.not. coord_in_bounds(z(kg), job%rms(ip), 3)) cycle
-                local_sum(jg) = local_sum(jg) + f(i,j,k)**2 * area_weight
+                field_value = f(i,j,k)
+                if (job%rms(ip)%subtract_reference) then
+                  ref_idx = (kg - 1) * nx + ig
+                  field_value = field_value - ref(ref_idx)
+                end if
+                local_sum(jg) = local_sum(jg) + field_value**2 * area_weight
               end do
             end do
           end do
@@ -1360,7 +1612,12 @@ contains
               do j = 1, nyloc
                 jg = ys + j - 1
                 if (.not. coord_in_bounds(y(jg), job%rms(ip), 2)) cycle
-                local_sum(kg) = local_sum(kg) + f(i,j,k)**2 * area_weight
+                field_value = f(i,j,k)
+                if (job%rms(ip)%subtract_reference) then
+                  ref_idx = (jg - 1) * nx + ig
+                  field_value = field_value - ref(ref_idx)
+                end if
+                local_sum(kg) = local_sum(kg) + field_value**2 * area_weight
               end do
             end do
           end do
@@ -1372,13 +1629,125 @@ contains
         l2norm = sqrt(global_sum)
         if (myrank == 0) then
           stem = expr_output_stem_case(job%rms(ip)%field, lists, job%rms(ip)%field%nterms, icase)
-          outname = trim(outdir)//'/'//trim(stem)//'_rms_'//job%rms(ip)%axis//'.csv'
+          if (job%rms(ip)%subtract_reference) then
+            rms_label = 'delta_rms'
+          else
+            rms_label = 'rms'
+          end if
+          outname = trim(outdir)//'/'//trim(stem)//'_'//trim(rms_label)//'_'//job%rms(ip)%axis//'.csv'
           call csv_profile_bounded(ni, trim(outname), job%rms(ip)%axis, coord, l2norm, job%rms(ip), profile_axis)
         end if
         deallocate(local_sum, global_sum, l2norm)
+        if (job%rms(ip)%subtract_reference) then
+          deallocate(local_ref_sum, global_ref_sum, local_ref_count, global_ref_count, ref)
+        end if
       end do
     end do
   end subroutine run_rms
+
+  subroutine run_linear_profiles(reader, Lx, Ly, Lz, path, outdir, job)
+    class(FieldReader2Decomp), intent(inout) :: reader
+    real(rk), intent(in) :: Lx, Ly, Lz
+    character(*), intent(in) :: path, outdir
+    type(diag_job_t), intent(in) :: job
+    integer :: nx, ny, nz, nxloc, nyloc, nzloc, xs, xe, ys, ye, zs, ze
+    integer :: ip, i, j, k, ig, jg, kg, ni, profile_axis, ierr, icase, ncases
+    real(rk) :: dx, dy, dz, area_weight
+    real(rk), allocatable, target :: x(:), y(:), z(:)
+    real(rk), pointer :: coord(:)
+    real(rk), allocatable :: f(:,:,:), scratch(:,:,:)
+    real(rk), allocatable :: local_sum(:), global_sum(:), local_area(:), global_area(:), avg(:)
+    type(file_list_t), allocatable :: lists(:)
+    character(len=:), allocatable :: outname, stem
+
+    call reader%global_shape(nx, ny, nz)
+    call reader%local_shape(nxloc, nyloc, nzloc)
+    call reader%indices(xs, xe, ys, ye, zs, ze)
+    allocate(f(nxloc,nyloc,nzloc), scratch(nxloc,nyloc,nzloc), x(nx), y(ny), z(nz))
+    call create_grid(Lx, Ly, Lz, nx, ny, nz, x, y, z)
+    dx = Lx/real(nx,rk); dy = Ly/real(ny,rk); dz = Lz/real(nz,rk)
+
+    do ip = 1, job%nprofiles
+      call expand_terms(path, job%profiles(ip)%field%terms, job%profiles(ip)%field%nterms, lists, ncases, ierr)
+      if (ierr /= 0) call abort_expand_error(ierr)
+      select case(job%profiles(ip)%axis)
+      case('x')
+        ni = nx; coord => x; area_weight = dy*dz; profile_axis = 1
+      case('y')
+        ni = ny; coord => y; area_weight = dx*dz; profile_axis = 2
+      case default
+        ni = nz; coord => z; area_weight = dx*dy; profile_axis = 3
+      end select
+      do icase = 1, ncases
+        call assemble_terms_case(reader, job%profiles(ip)%field%terms, job%profiles(ip)%field%nterms, lists, icase, f, scratch)
+        allocate(local_sum(ni), global_sum(ni), local_area(ni), global_area(ni), avg(ni))
+        local_sum = 0.0_rk
+        local_area = 0.0_rk
+
+        select case(job%profiles(ip)%axis)
+        case('x')
+          do i = 1, nxloc
+            ig = xs + i - 1
+            if (.not. coord_in_bounds(x(ig), job%profiles(ip), 1)) cycle
+            do j = 1, nyloc
+              jg = ys + j - 1
+              if (.not. coord_in_bounds(y(jg), job%profiles(ip), 2)) cycle
+              do k = 1, nzloc
+                kg = zs + k - 1
+                if (.not. coord_in_bounds(z(kg), job%profiles(ip), 3)) cycle
+                local_sum(ig) = local_sum(ig) + f(i,j,k) * area_weight
+                local_area(ig) = local_area(ig) + area_weight
+              end do
+            end do
+          end do
+        case('y')
+          do j = 1, nyloc
+            jg = ys + j - 1
+            if (.not. coord_in_bounds(y(jg), job%profiles(ip), 2)) cycle
+            do i = 1, nxloc
+              ig = xs + i - 1
+              if (.not. coord_in_bounds(x(ig), job%profiles(ip), 1)) cycle
+              do k = 1, nzloc
+                kg = zs + k - 1
+                if (.not. coord_in_bounds(z(kg), job%profiles(ip), 3)) cycle
+                local_sum(jg) = local_sum(jg) + f(i,j,k) * area_weight
+                local_area(jg) = local_area(jg) + area_weight
+              end do
+            end do
+          end do
+        case default
+          do k = 1, nzloc
+            kg = zs + k - 1
+            if (.not. coord_in_bounds(z(kg), job%profiles(ip), 3)) cycle
+            do i = 1, nxloc
+              ig = xs + i - 1
+              if (.not. coord_in_bounds(x(ig), job%profiles(ip), 1)) cycle
+              do j = 1, nyloc
+                jg = ys + j - 1
+                if (.not. coord_in_bounds(y(jg), job%profiles(ip), 2)) cycle
+                local_sum(kg) = local_sum(kg) + f(i,j,k) * area_weight
+                local_area(kg) = local_area(kg) + area_weight
+              end do
+            end do
+          end do
+        end select
+
+        call MPI_Allreduce(local_sum, global_sum, ni, mpi_rk, MPI_SUM, MPI_COMM_WORLD, ierr)
+        call MPI_Allreduce(local_area, global_area, ni, mpi_rk, MPI_SUM, MPI_COMM_WORLD, ierr)
+        avg = 0.0_rk
+        do i = 1, ni
+          if (global_area(i) > 0.0_rk) avg(i) = global_sum(i) / global_area(i)
+        end do
+
+        if (myrank == 0) then
+          stem = expr_output_stem_case(job%profiles(ip)%field, lists, job%profiles(ip)%field%nterms, icase)
+          outname = trim(outdir)//'/'//trim(stem)//'_avg_'//job%profiles(ip)%axis//'.csv'
+          call csv_linear_profile_bounded(ni, trim(outname), job%profiles(ip)%axis, coord, avg, job%profiles(ip), profile_axis)
+        end if
+        deallocate(local_sum, global_sum, local_area, global_area, avg)
+      end do
+    end do
+  end subroutine run_linear_profiles
 
   subroutine run_slices(reader, Lx, Ly, Lz, path, outdir, job)
     class(FieldReader2Decomp), intent(inout) :: reader
@@ -1976,6 +2345,22 @@ contains
     close(u)
   end subroutine csv_profile_bounded
 
+  subroutine csv_linear_profile_bounded(n, filename, axis, coord, profile, item, iax)
+    integer, intent(in) :: n, iax
+    character(*), intent(in) :: filename, axis
+    real(rk), intent(in) :: coord(n), profile(n)
+    type(rms_spec_t), intent(in) :: item
+    integer :: u, i
+    call message('Writing file: '//trim(filename))
+    open(newunit=u, file=trim(filename), status='replace', action='write')
+    write(u,'(A)') trim(axis)//',average'
+    do i = 1, n
+      if (.not. coord_in_bounds(coord(i), item, iax)) cycle
+      write(u,'(ES23.15,",",ES23.15)') coord(i), profile(i)
+    end do
+    close(u)
+  end subroutine csv_linear_profile_bounded
+
   subroutine export_slice_to_netcdf(fname, varname, slice, x1, x2, x1_name, x2_name)
     character(*), intent(in) :: fname, varname, x1_name, x2_name
     real(rk), intent(in) :: slice(:,:), x1(:), x2(:)
@@ -2242,6 +2627,8 @@ program MPIR3D_Lean_Main
     call run_slices(reader, Lx, Ly, Lz, trim(path), trim(outdir), job)
   case('rms')
     call run_rms(reader, Lx, Ly, Lz, trim(path), trim(outdir), job)
+  case('profile', 'profiles', 'linear_profile')
+    call run_linear_profiles(reader, Lx, Ly, Lz, trim(path), trim(outdir), job)
   case('abl')
     call run_abl(reader, Lx, Ly, Lz, trim(path), trim(outdir), job)
   case default

@@ -1,0 +1,12 @@
+&SETUP
+  nx       = 128
+  ny       = 128
+  nz       = 128
+  Lx       = 317.4603174603D0
+  Ly       = 158.7301587302D0
+  Lz       = 55.55555555555D0
+  path     = "/path/to/padeops/output"
+  outdir   = "/path/to/diagnostic/output"
+  driver   = "profile"
+  diag_map = "examples/profile_map.diag"
+/

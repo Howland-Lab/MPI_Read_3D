@@ -3,6 +3,8 @@
 # Bounds are xmin,xmax,ymin,ymax,zmin,zmax.  Use * for an open side.
 # The exported profile is sqrt(integral f**2 dA), i.e. a cross-plane L2 norm.
 # Divide offline by the bounded cross-sectional area if RMS normalization is desired.
+# Set subtract_reference=true to subtract a cross-plane reference field before
+# computing the L2 norm.  ref_bounds is a two-value interval along axis.
 
 driver = rms
 
@@ -23,4 +25,16 @@ rms {
   }
   axis = y
   bounds = 0.0,317.4603175,*,*,0.0,55.55555556
+}
+
+rms {
+  name = bounded_budget_combo_delta
+  expr {
+    (1.0)(Run05_budget0_term04_t000900_n123456.s3D)
+  + (-1.0)(Run05_budget0_term05_t000900_n123456.s3D)
+  }
+  axis = x
+  bounds = *,*,10.0,45.0,0.0,55.55555556
+  subtract_reference = true
+  ref_bounds = 0.0,20.0
 }

@@ -1,0 +1,26 @@
+# Linear profile driver.
+# Each profile block has its own field expression, profile axis, and optional
+# bounds.  Bounds are xmin,xmax,ymin,ymax,zmin,zmax.  Use * for an open side.
+# The exported profile is integral(f dA) / integral(dA) over the bounded
+# cross-plane.  For axis = x, this is a y-z average at each x.
+
+driver = profile
+
+profile {
+  name = u_yz_avg
+  expr {
+    (1.0)(Run05_uVel_t000900.out)
+  }
+  axis = x
+  bounds = *,*,*,*,*,*
+}
+
+profile {
+  name = bounded_budget_combo_yz_avg
+  expr {
+    (1.0)(Run05_budget0_term04_t000900_n123456.s3D)
+  + (-1.0)(Run05_budget0_term05_t000900_n123456.s3D)
+  }
+  axis = x
+  bounds = *,*,10.0,45.0,0.0,55.55555556
+}
