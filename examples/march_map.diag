@@ -1,0 +1,174 @@
+driver = march
+
+march {
+  axis = x
+  reference = deltau_les
+  normalizer = uinf
+  start = 200.0
+  end = 220.0
+  scheme = euler
+  rms = true
+  slices = 205.0,210.0,215.0,220.0
+}
+
+modes {
+  name = G0
+  remove = {
+  }
+
+  name = G1
+  remove = {
+    x_tiltadv_u, x_tiltadv_v, x_tiltadv_w, x_COR, x_SGS,
+    x_Reynolds_dubu, x_Reynolds_dubv, x_Reynolds_dubw,
+    x_Reynolds_budu, x_Reynolds_budv, x_Reynolds_budw,
+    x_baseadv_v, x_baseadv_w,
+    x_Reynolds_dudu
+  }
+
+  name = G2
+  remove = {
+    x_tiltadv_u, x_tiltadv_v, x_tiltadv_w, x_COR, x_SGS,
+    x_Reynolds_dubu, x_Reynolds_dubv, x_Reynolds_dubw,
+    x_Reynolds_budu, x_Reynolds_budv, x_Reynolds_budw,
+    x_baseadv_v, x_baseadv_w,
+    x_Reynolds_dudu,
+    x_nonlinadv_v, x_nonlinadv_w
+  }
+
+  name = G3
+  remove = {
+    x_tiltadv_u, x_tiltadv_v, x_tiltadv_w, x_COR, x_SGS,
+    x_Reynolds_dubu, x_Reynolds_dubv, x_Reynolds_dubw,
+    x_Reynolds_budu, x_Reynolds_budv, x_Reynolds_budw,
+    x_baseadv_v, x_baseadv_w,
+    x_Reynolds_dudu,
+    x_nonlinadv_v, x_nonlinadv_w,
+    x_nonlinadv_u
+  }
+
+  name = G4
+  remove = {
+    x_tiltadv_u, x_tiltadv_v, x_tiltadv_w, x_COR, x_SGS,
+    x_Reynolds_dubu, x_Reynolds_dubv, x_Reynolds_dubw,
+    x_Reynolds_budu, x_Reynolds_budv, x_Reynolds_budw,
+    x_baseadv_v, x_baseadv_w,
+    x_Reynolds_dudu,
+    x_nonlinadv_v, x_nonlinadv_w,
+    x_nonlinadv_u,
+    x_deltap
+  }
+  
+}
+
+fields {
+
+  name = uinf
+  expr {
+    (1.0)(Run08_budget0_term01_t000000_n000000.s3D)
+  }
+
+  name = deltau_les
+  expr {
+    (1.0)(Run09_comp_deficit_budget0_term01_t000000_n000000.s3D)
+  }
+
+  name = x_baseadv_v
+  expr {
+    (-1.0)(Run09_comp_deficit_budget5_term08_t101691_n019053.s3D)
+  }
+
+  name = x_baseadv_w
+  expr {
+    (-1.0)(Run09_comp_deficit_budget5_term09_t101691_n019053.s3D)
+  }
+
+  name = x_tiltadv_u
+  expr {
+    (-1.0)(Run09_comp_deficit_budget5_term04_t101691_n019053.s3D)
+  }
+  
+  name = x_tiltadv_v
+  expr {
+    (-1.0)(Run09_comp_deficit_budget5_term05_t101691_n019053.s3D)
+  }
+  
+  name = x_tiltadv_w
+  expr {
+    (-1.0)(Run09_comp_deficit_budget5_term06_t101691_n019053.s3D)
+  }
+  
+  name = x_nonlinadv_u
+  expr {
+    (-1.0)(Run09_comp_deficit_budget5_term01_t101691_n019053.s3D)
+  }
+  
+  name = x_nonlinadv_v
+  expr {
+    (-1.0)(Run09_comp_deficit_budget5_term02_t101691_n019053.s3D)
+  }
+  
+  name = x_nonlinadv_w
+  expr {
+    (-1.0)(Run09_comp_deficit_budget5_term03_t101691_n019053.s3D)
+  }
+
+  name = x_deltap
+  expr {
+    (-1.0)(Run09_comp_deficit_budget0_term18_t101691_n019053.s3D)
+  }
+  
+  name = x_SGS
+  expr {
+    (-1.0)(Run09_comp_deficit_budget0_term12_t101691_n019053.s3D)
+  }
+  
+  name = x_COR
+  expr {
+    (1.0)(Run09_comp_deficit_budget0_term15_t101691_n019053.s3D)
+  }
+  
+  name = x_Reynolds_dudu
+  expr {
+    (-1.0)(Run09_comp_deficit_budget5_term16_t101691_n019053.s3D)
+  }
+  
+  name = x_Reynolds_dudv
+  expr {
+    (-1.0)(Run09_comp_deficit_budget5_term17_t101691_n019053.s3D)
+  }
+  
+  name = x_Reynolds_dudw
+  expr {
+    (-1.0)(Run09_comp_deficit_budget5_term18_t101691_n019053.s3D)
+  }
+  
+  name = x_Reynolds_dubu
+  expr {
+    (-1.0)(Run09_comp_deficit_budget5_term19_t101691_n019053.s3D)
+  }
+  
+  name = x_Reynolds_dubv
+  expr {
+    (-1.0)(Run09_comp_deficit_budget5_term20_t101691_n019053.s3D)
+  }
+  
+  name = x_Reynolds_dubw
+  expr {
+    (-1.0)(Run09_comp_deficit_budget5_term21_t101691_n019053.s3D)
+  }
+  
+  name = x_Reynolds_budu
+  expr {
+    (-1.0)(Run09_comp_deficit_budget5_term22_t101691_n019053.s3D)
+  }
+  
+  name = x_Reynolds_budv
+  expr {
+    (-1.0)(Run09_comp_deficit_budget5_term23_t101691_n019053.s3D)
+  }
+  
+  name = x_Reynolds_budw
+  expr {
+    (-1.0)(Run09_comp_deficit_budget5_term24_t101691_n019053.s3D)
+  }
+}

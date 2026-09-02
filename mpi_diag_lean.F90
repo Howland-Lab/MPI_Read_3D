@@ -63,6 +63,11 @@ module MPIR3D_Lean
     character(len=str_len), allocatable :: names(:)
   end type file_list_t
 
+  type :: field_case_set_t
+    integer :: ncases = 0
+    type(file_list_t), allocatable :: lists(:)
+  end type field_case_set_t
+
   type :: field_expr_t
     character(len=name_len) :: name = ''
     character(len=32) :: derived = ''
@@ -106,6 +111,26 @@ module MPIR3D_Lean
     real(rk) :: inversion_xi = 1.3_rk
   end type abl_spec_t
 
+  type :: march_mode_t
+    character(len=name_len) :: name = ''
+    integer :: nremove = 0
+    character(len=name_len), allocatable :: remove(:)
+  end type march_mode_t
+
+  type :: march_spec_t
+    character(len=1) :: axis = 'x'
+    character(len=name_len) :: reference = ''
+    character(len=name_len) :: normalizer = ''
+    real(rk) :: start = 0.0_rk
+    real(rk) :: finish = 0.0_rk
+    character(len=32) :: scheme = 'euler'
+    logical :: export_rms = .false.
+    integer :: nslices = 0
+    real(rk), allocatable :: slices(:)
+    integer :: nmodes = 0
+    type(march_mode_t), allocatable :: modes(:)
+  end type march_spec_t
+
   type :: rz_params
     real(rk) :: tm = 0.0_rk
     real(rk) :: a = 0.0_rk
@@ -127,6 +152,7 @@ module MPIR3D_Lean
     integer :: nprofiles = 0
     type(rms_spec_t), allocatable :: profiles(:)
     type(abl_spec_t) :: abl
+    type(march_spec_t) :: march
   end type diag_job_t
 
 contains
@@ -420,6 +446,22 @@ contains
     call move_alloc(tmp, profiles)
     nprofiles = nprofiles + 1
   end subroutine append_profile
+
+  subroutine append_march_mode(modes, nmodes, mode)
+    type(march_mode_t), allocatable, intent(inout) :: modes(:)
+    integer, intent(inout) :: nmodes
+    type(march_mode_t), intent(in) :: mode
+    type(march_mode_t), allocatable :: tmp(:)
+    integer :: i
+    if (.not. allocated(modes)) allocate(modes(0))
+    allocate(tmp(nmodes + 1))
+    do i = 1, nmodes
+      tmp(i) = modes(i)
+    end do
+    tmp(nmodes + 1) = mode
+    call move_alloc(tmp, modes)
+    nmodes = nmodes + 1
+  end subroutine append_march_mode
 
   subroutine append_term_list(terms, nterms, coeff, filename)
     type(field_term_t), allocatable, intent(inout) :: terms(:)
@@ -767,6 +809,40 @@ contains
     call move_alloc(vals, values)
   end subroutine parse_real_csv
 
+  subroutine parse_name_csv(line, names, nnames, ierr)
+    character(*), intent(in) :: line
+    character(len=name_len), allocatable, intent(out) :: names(:)
+    integer, intent(out) :: nnames, ierr
+    character(len=str_len) :: tmp, token
+    character(len=name_len), allocatable :: vals(:), grown(:)
+    integer :: i, start, ntmp
+
+    ierr = 0
+    nnames = 0
+    allocate(vals(0))
+    tmp = trim(line)
+    if (len_trim(tmp) == 0) then
+      call move_alloc(vals, names)
+      return
+    end if
+    start = 1
+    do i = 1, len_trim(tmp) + 1
+      if (i > len_trim(tmp) .or. tmp(i:i) == ',') then
+        token = adjustl(trim(tmp(start:i-1)))
+        if (len_trim(token) > 0) then
+          ntmp = nnames + 1
+          allocate(grown(ntmp))
+          if (nnames > 0) grown(1:nnames) = vals
+          grown(ntmp) = trim(token)
+          call move_alloc(grown, vals)
+          nnames = ntmp
+        end if
+        start = i + 1
+      end if
+    end do
+    call move_alloc(vals, names)
+  end subroutine parse_name_csv
+
   subroutine read_diag_map(filename, job, ierr)
     character(*), intent(in) :: filename
     type(diag_job_t), intent(out) :: job
@@ -776,11 +852,15 @@ contains
 
     ierr = 0
     job%nfields = 0; job%nslices = 0; job%nrms = 0; job%nprofiles = 0
+    job%march%nmodes = 0; job%march%nslices = 0
     if (allocated(job%fields)) deallocate(job%fields)
     if (allocated(job%slices)) deallocate(job%slices)
     if (allocated(job%rms)) deallocate(job%rms)
     if (allocated(job%profiles)) deallocate(job%profiles)
+    if (allocated(job%march%modes)) deallocate(job%march%modes)
+    if (allocated(job%march%slices)) deallocate(job%march%slices)
     allocate(job%fields(0), job%slices(0), job%rms(0), job%profiles(0))
+    allocate(job%march%modes(0))
 
     open(newunit=unit, file=filename, status='old', action='read', iostat=ios)
     if (ios /= 0) then
@@ -797,8 +877,12 @@ contains
 
       if (key_is(low, 'driver')) then
         job%driver = trim(lower(value_after_equals(clean)))
+      else if (key_is(low, 'march')) then
+        call read_march_block(unit, job, ierr)
       else if (key_is(low, 'fields')) then
         call read_fields_block(unit, job, ierr)
+      else if (key_is(low, 'modes')) then
+        call read_modes_block(unit, job, ierr)
       else if (key_is(low, 'slices')) then
         call read_slice_block(unit, job, ierr)
       else if (key_is(low, 'rms')) then
@@ -814,6 +898,108 @@ contains
 
     if (ios > 0 .and. ierr == 0) ierr = ios
   end subroutine read_diag_map
+
+  subroutine read_march_block(unit, job, ierr)
+    integer, intent(in) :: unit
+    type(diag_job_t), intent(inout) :: job
+    integer, intent(out) :: ierr
+    character(len=str_len) :: line, clean, low, val
+    integer :: ios, nvals
+    real(rk), allocatable :: vals(:)
+
+    ierr = 0
+    do
+      read(unit, '(A)', iostat=ios) line
+      if (ios /= 0) then
+        ierr = ios
+        return
+      end if
+      clean = adjustl(trim(strip_comments(line)))
+      if (len_trim(clean) == 0) cycle
+      low = lower(clean)
+      if (clean(1:1) == '}') exit
+
+      if (key_is(low, 'axis')) then
+        val = adjustl(trim(value_after_equals(clean)))
+        val = lower(val)
+        job%march%axis = val(1:1)
+      else if (key_is(low, 'reference')) then
+        job%march%reference = trim(value_after_equals(clean))
+      else if (key_is(low, 'normalizer')) then
+        job%march%normalizer = trim(value_after_equals(clean))
+      else if (key_is(low, 'start')) then
+        val = value_after_equals(clean)
+        read(val, *, iostat=ierr) job%march%start
+        if (ierr /= 0) return
+      else if (key_is(low, 'end') .or. key_is(low, 'finish')) then
+        val = value_after_equals(clean)
+        read(val, *, iostat=ierr) job%march%finish
+        if (ierr /= 0) return
+      else if (key_is(low, 'scheme')) then
+        job%march%scheme = trim(lower(value_after_equals(clean)))
+      else if (key_is(low, 'rms')) then
+        val = value_after_equals(clean)
+        call parse_logical_value(trim(val), job%march%export_rms, ierr)
+        if (ierr /= 0) return
+      else if (key_is(low, 'slices')) then
+        val = value_after_equals(clean)
+        call parse_real_csv(trim(val), vals, nvals, ierr)
+        if (ierr /= 0) return
+        job%march%nslices = nvals
+        if (allocated(job%march%slices)) deallocate(job%march%slices)
+        call move_alloc(vals, job%march%slices)
+      end if
+    end do
+
+    if (.not. any(job%march%axis == ['x','y','z'])) ierr = 702
+    if (trim(job%march%scheme) /= 'euler' .and. trim(job%march%scheme) /= 'trapezoid') ierr = 703
+  end subroutine read_march_block
+
+  subroutine read_modes_block(unit, job, ierr)
+    integer, intent(in) :: unit
+    type(diag_job_t), intent(inout) :: job
+    integer, intent(out) :: ierr
+    character(len=str_len) :: line, clean, low, val, remove_text
+    integer :: ios
+    type(march_mode_t) :: mode
+
+    ierr = 0
+    mode = march_mode_t()
+    do
+      read(unit, '(A)', iostat=ios) line
+      if (ios /= 0) then
+        ierr = ios
+        return
+      end if
+      clean = adjustl(trim(strip_comments(line)))
+      if (len_trim(clean) == 0) cycle
+      low = lower(clean)
+      if (clean(1:1) == '}') exit
+
+      if (key_is(low, 'name')) then
+        if (len_trim(mode%name) > 0) then
+          call append_march_mode(job%march%modes, job%march%nmodes, mode)
+          mode = march_mode_t()
+        end if
+        mode%name = trim(value_after_equals(clean))
+      else if (key_is(low, 'remove') .or. key_is(low, 'fields')) then
+        if (index(clean, '{') > 0) then
+          call read_expr_body(unit, remove_text, ierr)
+        else
+          val = value_after_equals(clean)
+          remove_text = trim(val)
+        end if
+        if (ierr /= 0) return
+        call parse_name_csv(trim(remove_text), mode%remove, mode%nremove, ierr)
+        if (ierr /= 0) return
+      end if
+    end do
+
+    if (len_trim(mode%name) > 0) then
+      call append_march_mode(job%march%modes, job%march%nmodes, mode)
+    end if
+    if (job%march%nmodes <= 0) ierr = 704
+  end subroutine read_modes_block
 
   subroutine read_fields_block(unit, job, ierr)
     integer, intent(in) :: unit
@@ -1453,10 +1639,9 @@ contains
     integer :: nx, ny, nz, nxloc, nyloc, nzloc, xs, xe, ys, ye, zs, ze
     integer :: ip, i, j, k, ig, jg, kg, ni, profile_axis, ierr, icase, ncases
     integer :: ref_size, ref_idx
-    real(rk) :: dx, dy, dz, area_weight, field_value
     real(rk), allocatable, target :: x(:), y(:), z(:)
     real(rk), pointer :: coord(:)
-    real(rk), allocatable :: f(:,:,:), scratch(:,:,:), local_sum(:), global_sum(:), l2norm(:)
+    real(rk), allocatable :: f(:,:,:), scratch(:,:,:), l2norm(:)
     real(rk), allocatable :: local_ref_sum(:), global_ref_sum(:), local_ref_count(:), global_ref_count(:), ref(:)
     type(file_list_t), allocatable :: lists(:)
     character(len=:), allocatable :: outname, stem, rms_label
@@ -1466,19 +1651,19 @@ contains
     call reader%indices(xs, xe, ys, ye, zs, ze)
     allocate(f(nxloc,nyloc,nzloc), scratch(nxloc,nyloc,nzloc), x(nx), y(ny), z(nz))
     call create_grid(Lx, Ly, Lz, nx, ny, nz, x, y, z)
-    dx = Lx/real(nx,rk); dy = Ly/real(ny,rk); dz = Lz/real(nz,rk)
 
     do ip = 1, job%nrms
       call expand_terms(path, job%rms(ip)%field%terms, job%rms(ip)%field%nterms, lists, ncases, ierr)
       if (ierr /= 0) call abort_expand_error(ierr)
       select case(job%rms(ip)%axis)
       case('x')
-        ni = nx; coord => x; area_weight = dy*dz; profile_axis = 1
+        ni = nx; coord => x; profile_axis = 1
       case('y')
-        ni = ny; coord => y; area_weight = dx*dz; profile_axis = 2
+        ni = ny; coord => y; profile_axis = 2
       case default
-        ni = nz; coord => z; area_weight = dx*dy; profile_axis = 3
+        ni = nz; coord => z; profile_axis = 3
       end select
+      allocate(l2norm(ni))
       do icase = 1, ncases
         call assemble_terms_case(reader, job%rms(ip)%field%terms, job%rms(ip)%field%nterms, lists, icase, f, scratch)
         if (job%rms(ip)%subtract_reference) then
@@ -1558,75 +1743,12 @@ contains
               ref(ref_idx) = global_ref_sum(ref_idx) / global_ref_count(ref_idx)
             end if
           end do
+          call subtract_crossplane_reference(reader, f, job%rms(ip), ref)
         end if
 
-        allocate(local_sum(ni), global_sum(ni), l2norm(ni))
-        local_sum = 0.0_rk
-
-        select case(job%rms(ip)%axis)
-        case('x')
-          do i = 1, nxloc
-            ig = xs + i - 1
-            if (.not. coord_in_bounds(x(ig), job%rms(ip), 1)) cycle
-            do j = 1, nyloc
-              jg = ys + j - 1
-              if (.not. coord_in_bounds(y(jg), job%rms(ip), 2)) cycle
-              do k = 1, nzloc
-                kg = zs + k - 1
-                if (.not. coord_in_bounds(z(kg), job%rms(ip), 3)) cycle
-                field_value = f(i,j,k)
-                if (job%rms(ip)%subtract_reference) then
-                  ref_idx = (kg - 1) * ny + jg
-                  field_value = field_value - ref(ref_idx)
-                end if
-                local_sum(ig) = local_sum(ig) + field_value**2 * area_weight
-              end do
-            end do
-          end do
-        case('y')
-          do j = 1, nyloc
-            jg = ys + j - 1
-            if (.not. coord_in_bounds(y(jg), job%rms(ip), 2)) cycle
-            do i = 1, nxloc
-              ig = xs + i - 1
-              if (.not. coord_in_bounds(x(ig), job%rms(ip), 1)) cycle
-              do k = 1, nzloc
-                kg = zs + k - 1
-                if (.not. coord_in_bounds(z(kg), job%rms(ip), 3)) cycle
-                field_value = f(i,j,k)
-                if (job%rms(ip)%subtract_reference) then
-                  ref_idx = (kg - 1) * nx + ig
-                  field_value = field_value - ref(ref_idx)
-                end if
-                local_sum(jg) = local_sum(jg) + field_value**2 * area_weight
-              end do
-            end do
-          end do
-        case default
-          do k = 1, nzloc
-            kg = zs + k - 1
-            if (.not. coord_in_bounds(z(kg), job%rms(ip), 3)) cycle
-            do i = 1, nxloc
-              ig = xs + i - 1
-              if (.not. coord_in_bounds(x(ig), job%rms(ip), 1)) cycle
-              do j = 1, nyloc
-                jg = ys + j - 1
-                if (.not. coord_in_bounds(y(jg), job%rms(ip), 2)) cycle
-                field_value = f(i,j,k)
-                if (job%rms(ip)%subtract_reference) then
-                  ref_idx = (jg - 1) * nx + ig
-                  field_value = field_value - ref(ref_idx)
-                end if
-                local_sum(kg) = local_sum(kg) + field_value**2 * area_weight
-              end do
-            end do
-          end do
-        end select
-
-        call MPI_Allreduce(local_sum, global_sum, ni, mpi_rk, MPI_SUM, MPI_COMM_WORLD, ierr)
         ! This driver exports the cross-plane L2 norm, sqrt(integral f**2 dA).
         ! Area normalization to convert this profile to RMS is done offline.
-        l2norm = sqrt(global_sum)
+        call l2_profile_bounded(reader, x, y, z, Lx, Ly, Lz, f, job%rms(ip), l2norm)
         if (myrank == 0) then
           stem = expr_output_stem_case(job%rms(ip)%field, lists, job%rms(ip)%field%nterms, icase)
           if (job%rms(ip)%subtract_reference) then
@@ -1635,13 +1757,14 @@ contains
             rms_label = 'rms'
           end if
           outname = trim(outdir)//'/'//trim(stem)//'_'//trim(rms_label)//'_'//job%rms(ip)%axis//'.csv'
-          call csv_profile_bounded(ni, trim(outname), job%rms(ip)%axis, coord, l2norm, job%rms(ip), profile_axis)
+          call csv_profile_bounded(ni, trim(outname), job%rms(ip)%axis, coord, l2norm, &
+            job%rms(ip), profile_axis, 'l2_norm')
         end if
-        deallocate(local_sum, global_sum, l2norm)
         if (job%rms(ip)%subtract_reference) then
           deallocate(local_ref_sum, global_ref_sum, local_ref_count, global_ref_count, ref)
         end if
       end do
+      deallocate(l2norm)
     end do
   end subroutine run_rms
 
@@ -1742,7 +1865,8 @@ contains
         if (myrank == 0) then
           stem = expr_output_stem_case(job%profiles(ip)%field, lists, job%profiles(ip)%field%nterms, icase)
           outname = trim(outdir)//'/'//trim(stem)//'_avg_'//job%profiles(ip)%axis//'.csv'
-          call csv_linear_profile_bounded(ni, trim(outname), job%profiles(ip)%axis, coord, avg, job%profiles(ip), profile_axis)
+          call csv_profile_bounded(ni, trim(outname), job%profiles(ip)%axis, coord, avg, &
+            job%profiles(ip), profile_axis, 'average')
         end if
         deallocate(local_sum, global_sum, local_area, global_area, avg)
       end do
@@ -2030,6 +2154,451 @@ contains
     real(rk), intent(in) :: x
     g_basis = 0.5_rk * (log_2cosh_stable(x) + x)
   end function g_basis
+
+  subroutine run_march(reader, Lx, Ly, Lz, path, outdir, job)
+    class(FieldReader2Decomp), intent(inout) :: reader
+    real(rk), intent(in) :: Lx, Ly, Lz
+    character(*), intent(in) :: path, outdir
+    type(diag_job_t), intent(in) :: job
+    integer :: nx, ny, nz, nxloc, nyloc, nzloc, xs, xe, ys_dum, ye_dum, zs_dum, ze_dum
+    integer :: norm_field_idx, ref_field_idx, ierr, imode, field_idx, icase, ncases
+    integer :: istart, iend, islice, idx
+    integer, allocatable :: slice_idx(:)
+    real(rk) :: dx
+    real(rk), allocatable, target :: x(:), y(:), z(:)
+    real(rk), allocatable :: normalizer(:,:,:), ref(:,:,:), rhs(:,:,:)
+    real(rk), allocatable :: recon(:,:,:), scratch(:,:,:)
+    real(rk), allocatable :: profile(:)
+    type(field_case_set_t), allocatable :: case_sets(:)
+    type(rms_spec_t) :: range_spec
+    character(len=str_len) :: fname, ref_name
+    character(len=name_len) :: mode_name
+    character(len=32) :: case_suffix
+
+    call reader%global_shape(nx, ny, nz)
+    call reader%local_shape(nxloc, nyloc, nzloc)
+    call reader%indices(xs, xe, ys_dum, ye_dum, zs_dum, ze_dum)
+    if (xs /= 1 .or. xe /= nx) then
+      call message('ERROR: march driver requires full x-lines on each rank.')
+      call MPI_Abort(MPI_COMM_WORLD, 720, ierr)
+    end if
+
+    allocate(x(nx), y(ny), z(nz))
+    call create_grid(Lx, Ly, Lz, nx, ny, nz, x, y, z)
+    dx = Lx / real(nx, rk)
+
+    if (job%march%axis /= 'x') then
+      call message('ERROR: march driver currently supports axis = x only.')
+      call MPI_Abort(MPI_COMM_WORLD, 721, ierr)
+    end if
+
+    istart = nearest_grid_index(x, job%march%start)
+    iend = nearest_grid_index(x, job%march%finish)
+    range_spec = rms_spec_t()
+    range_spec%axis = 'x'
+    range_spec%bounds_min(1) = min(x(istart), x(iend))
+    range_spec%bounds_max(1) = max(x(istart), x(iend))
+    range_spec%has_min(1) = .true.
+    range_spec%has_max(1) = .true.
+    if (myrank == 0) then
+      call message('MARCH: requested start='//trim(real_to_tag(job%march%start))// &
+        ', using x('//trim(int_to_string(istart))//')='//trim(real_to_tag(x(istart))))
+      call message('MARCH: requested end='//trim(real_to_tag(job%march%finish))// &
+        ', using x('//trim(int_to_string(iend))//')='//trim(real_to_tag(x(iend))))
+      call message('MARCH: scheme='//trim(job%march%scheme))
+    end if
+    if (job%march%nslices > 0) then
+      allocate(slice_idx(job%march%nslices))
+      do islice = 1, job%march%nslices
+        slice_idx(islice) = nearest_grid_index(x, job%march%slices(islice))
+        if (myrank == 0) then
+          call message('MARCH: requested slice='//trim(real_to_tag(job%march%slices(islice)))// &
+            ', using x('//trim(int_to_string(slice_idx(islice)))//')='// &
+            trim(real_to_tag(x(slice_idx(islice)))))
+        end if
+      end do
+    end if
+
+    ref_name = trim(job%march%reference)
+    if (len_trim(ref_name) == 0) then
+      call message('ERROR: march driver requires reference = <field_name>.')
+      call MPI_Abort(MPI_COMM_WORLD, 727, ierr)
+    end if
+    ref_field_idx = find_field(job, trim(ref_name))
+    if (ref_field_idx <= 0) then
+      call message('ERROR: march reference field not found: '//trim(ref_name))
+      call MPI_Abort(MPI_COMM_WORLD, 722, ierr)
+    end if
+    norm_field_idx = 0
+    if (len_trim(job%march%normalizer) > 0) then
+      norm_field_idx = find_field(job, trim(job%march%normalizer))
+      if (norm_field_idx <= 0) then
+        call message('ERROR: march normalizer field not found: '//trim(job%march%normalizer))
+        call MPI_Abort(MPI_COMM_WORLD, 726, ierr)
+      end if
+    end if
+    if (job%march%nmodes <= 0) then
+      call message('ERROR: march driver requires at least one mode.')
+      call MPI_Abort(MPI_COMM_WORLD, 723, ierr)
+    end if
+
+    call prepare_field_case_sets(path, job, case_sets, ncases)
+    call validate_march_modes(job, ref_field_idx, norm_field_idx)
+
+    allocate(ref(nxloc,nyloc,nzloc), rhs(nxloc,nyloc,nzloc), recon(nxloc,nyloc,nzloc), &
+      scratch(nxloc,nyloc,nzloc), profile(nx))
+    if (norm_field_idx > 0) allocate(normalizer(nxloc,nyloc,nzloc))
+
+    do icase = 1, ncases
+      case_suffix = march_case_suffix(icase, ncases)
+      call assemble_field_from_case_set(reader, job%fields(ref_field_idx), case_sets(ref_field_idx), icase, ref, scratch)
+      if (norm_field_idx > 0) then
+        call assemble_field_from_case_set(reader, job%fields(norm_field_idx), case_sets(norm_field_idx), icase, normalizer, scratch)
+      end if
+
+      if (job%march%nslices > 0) then
+        do islice = 1, job%march%nslices
+          idx = slice_idx(islice)
+          fname = trim(outdir)//'/'//trim(ref_name)//trim(case_suffix)// &
+            '_SL_x='//trim(real_to_tag(x(idx)))//'.nc'
+          call export_x_plane_to_netcdf(reader, trim(fname), trim(ref_name), ref, idx, y, z)
+        end do
+      end if
+
+      do imode = 1, job%march%nmodes
+        mode_name = trim(job%march%modes(imode)%name)
+        rhs = 0.0_rk
+        do field_idx = 1, job%nfields
+          if (field_idx == ref_field_idx .or. field_idx == norm_field_idx) cycle
+          if (mode_removes_field(job%march%modes(imode), trim(job%fields(field_idx)%name))) cycle
+          call assemble_field_from_case_set(reader, job%fields(field_idx), case_sets(field_idx), icase, recon, scratch)
+          rhs = rhs + recon
+        end do
+
+        if (norm_field_idx > 0) then
+          rhs = rhs / normalizer
+        end if
+        call integrate_march_x(ref, rhs, recon, dx, istart, iend, trim(job%march%scheme))
+        ! Reuse scratch as the 3D error field after file assembly is complete.
+        scratch = recon - ref
+
+        if (job%march%export_rms) then
+          call l2_profile_bounded(reader, x, y, z, Lx, Ly, Lz, recon, range_spec, profile)
+          fname = trim(outdir)//'/'//trim(mode_name)//trim(case_suffix)//'_'//trim(ref_name)//'_rms_x.csv'
+          if (myrank == 0) then
+            call csv_profile_bounded(nx, trim(fname), 'x', x, profile, range_spec, 1, 'l2_norm')
+          end if
+          call l2_profile_bounded(reader, x, y, z, Lx, Ly, Lz, scratch, range_spec, profile)
+          fname = trim(outdir)//'/'//trim(mode_name)//trim(case_suffix)//'_error_rms_x.csv'
+          if (myrank == 0) then
+            call csv_profile_bounded(nx, trim(fname), 'x', x, profile, range_spec, 1, 'l2_norm')
+          end if
+        end if
+
+        if (job%march%nslices > 0) then
+          do islice = 1, job%march%nslices
+            idx = slice_idx(islice)
+            fname = trim(outdir)//'/'//trim(mode_name)//trim(case_suffix)//'_recon_SL_x='// &
+              trim(real_to_tag(x(idx)))//'.nc'
+            call export_x_plane_to_netcdf(reader, trim(fname), trim(mode_name)//'_'//trim(ref_name), recon, idx, y, z)
+            fname = trim(outdir)//'/'//trim(mode_name)//trim(case_suffix)//'_error_SL_x='// &
+              trim(real_to_tag(x(idx)))//'.nc'
+            call export_x_plane_to_netcdf(reader, trim(fname), trim(mode_name)//'_error', scratch, idx, y, z)
+          end do
+        end if
+      end do
+
+      if (job%march%export_rms) then
+        call l2_profile_bounded(reader, x, y, z, Lx, Ly, Lz, ref, range_spec, profile)
+        fname = trim(outdir)//'/'//trim(ref_name)//trim(case_suffix)//'_rms_x.csv'
+        if (myrank == 0) then
+          call csv_profile_bounded(nx, trim(fname), 'x', x, profile, range_spec, 1, 'l2_norm')
+        end if
+      end if
+    end do
+  end subroutine run_march
+
+  function march_case_suffix(icase, ncases) result(suffix)
+    integer, intent(in) :: icase, ncases
+    character(len=:), allocatable :: suffix
+    if (ncases > 1) then
+      suffix = '_case'//trim(int_to_string(icase))
+    else
+      suffix = ''
+    end if
+  end function march_case_suffix
+
+  integer function find_field(job, name) result(idx)
+    type(diag_job_t), intent(in) :: job
+    character(*), intent(in) :: name
+    integer :: i
+    idx = 0
+    do i = 1, job%nfields
+      if (trim(lower(job%fields(i)%name)) == trim(lower(name))) then
+        idx = i
+        return
+      end if
+    end do
+  end function find_field
+
+  logical function mode_removes_field(mode, field_name) result(removes)
+    type(march_mode_t), intent(in) :: mode
+    character(*), intent(in) :: field_name
+    integer :: i
+    removes = .false.
+    do i = 1, mode%nremove
+      if (trim(lower(mode%remove(i))) == trim(lower(field_name))) then
+        removes = .true.
+        return
+      end if
+    end do
+  end function mode_removes_field
+
+  subroutine validate_march_modes(job, ref_field_idx, norm_field_idx)
+    type(diag_job_t), intent(in) :: job
+    integer, intent(in) :: ref_field_idx, norm_field_idx
+    integer :: imode, iremove, remove_idx
+    do imode = 1, job%march%nmodes
+      do iremove = 1, job%march%modes(imode)%nremove
+        remove_idx = find_field(job, trim(job%march%modes(imode)%remove(iremove)))
+        if (remove_idx <= 0) then
+          call message('WARNING: march mode '//trim(job%march%modes(imode)%name)// &
+            ' removes unknown field '//trim(job%march%modes(imode)%remove(iremove))//'; ignoring.')
+        else if (remove_idx == ref_field_idx .or. remove_idx == norm_field_idx) then
+          call message('WARNING: march mode '//trim(job%march%modes(imode)%name)// &
+            ' removes reference/normalizer field '//trim(job%march%modes(imode)%remove(iremove))// &
+            '; this has no effect.')
+        end if
+      end do
+    end do
+  end subroutine validate_march_modes
+
+  subroutine prepare_field_case_sets(path, job, case_sets, ncases_total)
+    character(*), intent(in) :: path
+    type(diag_job_t), intent(in) :: job
+    type(field_case_set_t), allocatable, intent(out) :: case_sets(:)
+    integer, intent(out) :: ncases_total
+    integer :: ifield, ierr
+    ncases_total = 1
+    if (allocated(case_sets)) deallocate(case_sets)
+    allocate(case_sets(job%nfields))
+    do ifield = 1, job%nfields
+      if (job%fields(ifield)%nterms <= 0) then
+        call message('ERROR: march driver does not support derived fields (field: '// &
+          trim(job%fields(ifield)%name)//').')
+        call MPI_Abort(MPI_COMM_WORLD, 725, ierr)
+      end if
+      call expand_terms(path, job%fields(ifield)%terms, job%fields(ifield)%nterms, &
+        case_sets(ifield)%lists, case_sets(ifield)%ncases, ierr)
+      if (ierr /= 0) call abort_expand_error(ierr)
+      ncases_total = max(ncases_total, case_sets(ifield)%ncases)
+    end do
+    do ifield = 1, job%nfields
+      if (case_sets(ifield)%ncases /= 1 .and. case_sets(ifield)%ncases /= ncases_total) then
+        call message('ERROR: march wildcard fields must have one case or the same number of cases.')
+        call MPI_Abort(MPI_COMM_WORLD, 724, ierr)
+      end if
+    end do
+  end subroutine prepare_field_case_sets
+
+  subroutine assemble_field_from_case_set(reader, field, case_set, icase, f, scratch)
+    class(FieldReader2Decomp), intent(inout) :: reader
+    type(field_expr_t), intent(in) :: field
+    type(field_case_set_t), intent(in) :: case_set
+    integer, intent(in) :: icase
+    real(rk), intent(out) :: f(:,:,:)
+    real(rk), intent(inout) :: scratch(:,:,:)
+    call assemble_terms_case(reader, field%terms, field%nterms, case_set%lists, icase, f, scratch)
+  end subroutine assemble_field_from_case_set
+
+  integer function nearest_grid_index(coord, value) result(idx)
+    real(rk), intent(in) :: coord(:), value
+    integer :: i
+    real(rk) :: best, dist
+    idx = 1
+    best = abs(coord(1) - value)
+    do i = 2, size(coord)
+      dist = abs(coord(i) - value)
+      if (dist < best) then
+        best = dist
+        idx = i
+      end if
+    end do
+  end function nearest_grid_index
+
+  subroutine integrate_march_x(ref, dfdx, recon, dx, istart, iend, scheme)
+    real(rk), intent(in) :: ref(:,:,:), dfdx(:,:,:), dx
+    real(rk), intent(out) :: recon(:,:,:)
+    integer, intent(in) :: istart, iend
+    character(*), intent(in) :: scheme
+    integer :: i, idir
+    recon = ref
+    idir = merge(1, -1, iend >= istart)
+    if (istart == iend) return
+    do i = istart, iend - idir, idir
+      if (trim(scheme) == 'trapezoid') then
+        recon(i+idir,:,:) = recon(i,:,:) + real(idir, rk) * dx * &
+          0.5_rk * (dfdx(i,:,:) + dfdx(i+idir,:,:))
+      else
+        recon(i+idir,:,:) = recon(i,:,:) + real(idir, rk) * dx * dfdx(i,:,:)
+      end if
+    end do
+  end subroutine integrate_march_x
+
+  subroutine subtract_crossplane_reference(reader, f, item, ref)
+    class(FieldReader2Decomp), intent(inout) :: reader
+    real(rk), intent(inout) :: f(:,:,:)
+    type(rms_spec_t), intent(in) :: item
+    real(rk), intent(in) :: ref(:)
+    integer :: nx, ny, nz, nxloc, nyloc, nzloc, xs, xe, ys, ye, zs, ze
+    integer :: i, j, k, ig, jg, kg, ref_idx
+    call reader%global_shape(nx, ny, nz)
+    call reader%local_shape(nxloc, nyloc, nzloc)
+    call reader%indices(xs, xe, ys, ye, zs, ze)
+
+    select case(item%axis)
+    case('x')
+      do i = 1, nxloc
+        do j = 1, nyloc
+          jg = ys + j - 1
+          do k = 1, nzloc
+            kg = zs + k - 1
+            ref_idx = (kg - 1) * ny + jg
+            f(i,j,k) = f(i,j,k) - ref(ref_idx)
+          end do
+        end do
+      end do
+    case('y')
+      do j = 1, nyloc
+        do i = 1, nxloc
+          ig = xs + i - 1
+          do k = 1, nzloc
+            kg = zs + k - 1
+            ref_idx = (kg - 1) * nx + ig
+            f(i,j,k) = f(i,j,k) - ref(ref_idx)
+          end do
+        end do
+      end do
+    case default
+      do k = 1, nzloc
+        do i = 1, nxloc
+          ig = xs + i - 1
+          do j = 1, nyloc
+            jg = ys + j - 1
+            ref_idx = (jg - 1) * nx + ig
+            f(i,j,k) = f(i,j,k) - ref(ref_idx)
+          end do
+        end do
+      end do
+    end select
+  end subroutine subtract_crossplane_reference
+
+  subroutine l2_profile_bounded(reader, x, y, z, Lx, Ly, Lz, f, item, profile)
+    class(FieldReader2Decomp), intent(inout) :: reader
+    real(rk), intent(in) :: x(:), y(:), z(:), Lx, Ly, Lz, f(:,:,:)
+    type(rms_spec_t), intent(in) :: item
+    real(rk), intent(out) :: profile(:)
+    integer :: nx, ny, nz, nxloc, nyloc, nzloc, xs, xe, ys, ye, zs, ze
+    integer :: i, j, k, ig, jg, kg, ni, ierr
+    real(rk) :: dx, dy, dz, area_weight
+    real(rk), allocatable :: local_sum(:), global_sum(:)
+
+    call reader%global_shape(nx, ny, nz)
+    call reader%local_shape(nxloc, nyloc, nzloc)
+    call reader%indices(xs, xe, ys, ye, zs, ze)
+    dx = Lx / real(nx, rk)
+    dy = Ly / real(ny, rk)
+    dz = Lz / real(nz, rk)
+
+    select case(item%axis)
+    case('x')
+      ni = nx
+      area_weight = dy * dz
+    case('y')
+      ni = ny
+      area_weight = dx * dz
+    case default
+      ni = nz
+      area_weight = dx * dy
+    end select
+
+    allocate(local_sum(ni), global_sum(ni))
+    local_sum = 0.0_rk
+
+    select case(item%axis)
+    case('x')
+      do i = 1, nxloc
+        ig = xs + i - 1
+        if (.not. coord_in_bounds(x(ig), item, 1)) cycle
+        do j = 1, nyloc
+          jg = ys + j - 1
+          if (.not. coord_in_bounds(y(jg), item, 2)) cycle
+          do k = 1, nzloc
+            kg = zs + k - 1
+            if (.not. coord_in_bounds(z(kg), item, 3)) cycle
+            local_sum(ig) = local_sum(ig) + f(i,j,k)**2 * area_weight
+          end do
+        end do
+      end do
+    case('y')
+      do j = 1, nyloc
+        jg = ys + j - 1
+        if (.not. coord_in_bounds(y(jg), item, 2)) cycle
+        do i = 1, nxloc
+          ig = xs + i - 1
+          if (.not. coord_in_bounds(x(ig), item, 1)) cycle
+          do k = 1, nzloc
+            kg = zs + k - 1
+            if (.not. coord_in_bounds(z(kg), item, 3)) cycle
+            local_sum(jg) = local_sum(jg) + f(i,j,k)**2 * area_weight
+          end do
+        end do
+      end do
+    case default
+      do k = 1, nzloc
+        kg = zs + k - 1
+        if (.not. coord_in_bounds(z(kg), item, 3)) cycle
+        do i = 1, nxloc
+          ig = xs + i - 1
+          if (.not. coord_in_bounds(x(ig), item, 1)) cycle
+          do j = 1, nyloc
+            jg = ys + j - 1
+            if (.not. coord_in_bounds(y(jg), item, 2)) cycle
+            local_sum(kg) = local_sum(kg) + f(i,j,k)**2 * area_weight
+          end do
+        end do
+      end do
+    end select
+
+    call MPI_Allreduce(local_sum, global_sum, ni, mpi_rk, MPI_SUM, MPI_COMM_WORLD, ierr)
+    profile = sqrt(global_sum)
+    deallocate(local_sum, global_sum)
+  end subroutine l2_profile_bounded
+
+  subroutine export_x_plane_to_netcdf(reader, fname, varname, f, idx, y, z)
+    class(FieldReader2Decomp), intent(inout) :: reader
+    character(*), intent(in) :: fname, varname
+    real(rk), intent(in) :: f(:,:,:), y(:), z(:)
+    integer, intent(in) :: idx
+    integer :: nx, ny, nz, nxloc, nyloc, nzloc, xs, xe, ys, ye, zs, ze, ierr
+    real(rk), allocatable :: local(:,:), global(:,:)
+    call reader%global_shape(nx, ny, nz)
+    call reader%local_shape(nxloc, nyloc, nzloc)
+    call reader%indices(xs, xe, ys, ye, zs, ze)
+    allocate(local(ny,nz))
+    if (myrank == 0) then
+      allocate(global(ny,nz))
+    else
+      allocate(global(1,1))
+    end if
+    local = 0.0_rk
+    if (idx >= xs .and. idx <= xe) then
+      local(ys:ye,zs:ze) = f(idx-xs+1,:,:)
+    end if
+    call MPI_Reduce(local, global, ny*nz, mpi_rk, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
+    if (myrank == 0) call export_slice_to_netcdf(trim(fname), trim(varname), global, y, z, 'y', 'z')
+    deallocate(local, global)
+  end subroutine export_x_plane_to_netcdf
 
   subroutine fit_rz_profile(z, t, n, l0, d0, params, d_min, ridge, max_iter, tol)
     integer, intent(in) :: n
@@ -2329,37 +2898,21 @@ contains
     close(u)
   end subroutine csv_profile
 
-  subroutine csv_profile_bounded(n, filename, axis, coord, profile, item, iax)
+  subroutine csv_profile_bounded(n, filename, axis, coord, profile, item, iax, header)
     integer, intent(in) :: n, iax
-    character(*), intent(in) :: filename, axis
+    character(*), intent(in) :: filename, axis, header
     real(rk), intent(in) :: coord(n), profile(n)
     type(rms_spec_t), intent(in) :: item
     integer :: u, i
     call message('Writing file: '//trim(filename))
     open(newunit=u, file=trim(filename), status='replace', action='write')
-    write(u,'(A)') trim(axis)//',l2_norm'
+    write(u,'(A)') trim(axis)//','//trim(header)
     do i = 1, n
       if (.not. coord_in_bounds(coord(i), item, iax)) cycle
       write(u,'(ES23.15,",",ES23.15)') coord(i), profile(i)
     end do
     close(u)
   end subroutine csv_profile_bounded
-
-  subroutine csv_linear_profile_bounded(n, filename, axis, coord, profile, item, iax)
-    integer, intent(in) :: n, iax
-    character(*), intent(in) :: filename, axis
-    real(rk), intent(in) :: coord(n), profile(n)
-    type(rms_spec_t), intent(in) :: item
-    integer :: u, i
-    call message('Writing file: '//trim(filename))
-    open(newunit=u, file=trim(filename), status='replace', action='write')
-    write(u,'(A)') trim(axis)//',average'
-    do i = 1, n
-      if (.not. coord_in_bounds(coord(i), item, iax)) cycle
-      write(u,'(ES23.15,",",ES23.15)') coord(i), profile(i)
-    end do
-    close(u)
-  end subroutine csv_linear_profile_bounded
 
   subroutine export_slice_to_netcdf(fname, varname, slice, x1, x2, x1_name, x2_name)
     character(*), intent(in) :: fname, varname, x1_name, x2_name
@@ -2631,6 +3184,8 @@ program MPIR3D_Lean_Main
     call run_linear_profiles(reader, Lx, Ly, Lz, trim(path), trim(outdir), job)
   case('abl')
     call run_abl(reader, Lx, Ly, Lz, trim(path), trim(outdir), job)
+  case('march')
+    call run_march(reader, Lx, Ly, Lz, trim(path), trim(outdir), job)
   case default
     call message('ERROR: unknown driver '//trim(job%driver))
     call MPI_Abort(MPI_COMM_WORLD, 5, ierr)

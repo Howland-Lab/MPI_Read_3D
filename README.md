@@ -93,6 +93,7 @@ slice   2D slices and integrated slices
 rms     cross-plane L2 norm profiles
 profile cross-plane linear average profiles
 abl     ABL height diagnostics
+march   x-marched streamwise deficit reconstructions
 ```
 
 For slices, all `slices {}` blocks operate on all fields:
@@ -215,6 +216,48 @@ profile {
 
 The output is named like `u_yz_avg_avg_x.csv` and contains `x,average`.
 
+The `march` driver reconstructs a named reference field from
+`d(field)/dx = RHS`, optionally using `d(field)/dx = RHS / normalizer`. It
+starts from the LES `reference` plane at `march%start`. It currently supports
+`axis = x`, uses nearest grid points for `start`, `end`, and requested slice
+stations, and logs the selected indices. Set `scheme = euler` or
+`scheme = trapezoid`. The `reference` field is required; `normalizer` is
+optional. If either named field is missing from `fields {}`, the run stops.
+Every other field in `fields {}` is treated as an RHS term unless a mode lists
+it under `remove`.
+
+```text
+driver = march
+
+march {
+  axis = x
+  reference = deltau_les
+  normalizer = uinf
+  start = 200.0
+  end = 220.0
+  scheme = euler
+  rms = true
+  slices = 205.0,210.0,215.0,220.0
+}
+
+modes {
+  name = G0
+  remove = {
+  }
+
+  name = G1
+  remove = {
+    x_tiltadv_u, x_tiltadv_v, x_SGS
+  }
+}
+```
+
+When `rms = true`, the driver writes the same cross-plane L2 convention used by
+the `rms` driver: `sqrt(integral_yz f**2 dA)`. It exports reference-field
+profiles, mode reconstruction profiles, and mode error profiles, with errors
+formed in 3D before the L2 profile is computed. NetCDF slice output includes
+the reference field, each mode reconstruction, and each mode error.
+
 ## Examples
 
 Copy and edit the templates in `examples/`:
@@ -230,6 +273,7 @@ examples/rms_input.dat
 examples/rms_map.diag
 examples/profile_input.dat
 examples/profile_map.diag
+examples/march_map.diag
 examples/abl_input.dat
 examples/abl_stress_map.diag
 examples/abl_inversion_map.diag
