@@ -237,6 +237,7 @@ march {
   end = 220.0
   scheme = euler
   rms = true
+  linear_average = true
   slices = 205.0,210.0,215.0,220.0
 }
 
@@ -253,10 +254,17 @@ modes {
 ```
 
 When `rms = true`, the driver writes the same cross-plane L2 convention used by
-the `rms` driver: `sqrt(integral_yz f**2 dA)`. It exports reference-field
-profiles, mode reconstruction profiles, and mode error profiles, with errors
-formed in 3D before the L2 profile is computed. NetCDF slice output includes
-the reference field, each mode reconstruction, and each mode error.
+the `rms` driver: `sqrt(integral_yz f**2 dA)`. When `linear_average = true`,
+it writes the bounded area-weighted mean used by the `profile` driver. It
+exports reference-field profiles, mode reconstruction profiles, and mode error
+profiles. For error outputs, it first forms the 3D difference between the
+reconstruction and reference fields, then reduces that error field to either an
+RMS or linear-average profile. NetCDF slice output includes the reference
+field, each mode reconstruction, and each mode error.
+
+The march profile filenames use `_rms_` or `_avg_`, for example
+`G0_deltau_les_rms_x.csv`, `G0_deltau_les_avg_x.csv`, `G0_error_rms_x.csv`,
+and `G0_error_avg_x.csv`.
 
 ## Examples
 

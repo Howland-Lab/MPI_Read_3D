@@ -125,6 +125,7 @@ module MPIR3D_Lean
     real(rk) :: finish = 0.0_rk
     character(len=32) :: scheme = 'euler'
     logical :: export_rms = .false.
+    logical :: export_linear_average = .false.
     integer :: nslices = 0
     real(rk), allocatable :: slices(:)
     integer :: nmodes = 0
@@ -940,6 +941,10 @@ contains
       else if (key_is(low, 'rms')) then
         val = value_after_equals(clean)
         call parse_logical_value(trim(val), job%march%export_rms, ierr)
+        if (ierr /= 0) return
+      else if (key_is(low, 'linear_average') .or. key_is(low, 'average')) then
+        val = value_after_equals(clean)
+        call parse_logical_value(trim(val), job%march%export_linear_average, ierr)
         if (ierr /= 0) return
       else if (key_is(low, 'slices')) then
         val = value_after_equals(clean)
@@ -1774,12 +1779,12 @@ contains
     character(*), intent(in) :: path, outdir
     type(diag_job_t), intent(in) :: job
     integer :: nx, ny, nz, nxloc, nyloc, nzloc, xs, xe, ys, ye, zs, ze
-    integer :: ip, i, j, k, ig, jg, kg, ni, profile_axis, ierr, icase, ncases
+    integer :: ip, ni, profile_axis, ierr, icase, ncases
     real(rk) :: dx, dy, dz, area_weight
     real(rk), allocatable, target :: x(:), y(:), z(:)
     real(rk), pointer :: coord(:)
     real(rk), allocatable :: f(:,:,:), scratch(:,:,:)
-    real(rk), allocatable :: local_sum(:), global_sum(:), local_area(:), global_area(:), avg(:)
+    real(rk), allocatable :: avg(:)
     type(file_list_t), allocatable :: lists(:)
     character(len=:), allocatable :: outname, stem
 
@@ -1803,64 +1808,8 @@ contains
       end select
       do icase = 1, ncases
         call assemble_terms_case(reader, job%profiles(ip)%field%terms, job%profiles(ip)%field%nterms, lists, icase, f, scratch)
-        allocate(local_sum(ni), global_sum(ni), local_area(ni), global_area(ni), avg(ni))
-        local_sum = 0.0_rk
-        local_area = 0.0_rk
-
-        select case(job%profiles(ip)%axis)
-        case('x')
-          do i = 1, nxloc
-            ig = xs + i - 1
-            if (.not. coord_in_bounds(x(ig), job%profiles(ip), 1)) cycle
-            do j = 1, nyloc
-              jg = ys + j - 1
-              if (.not. coord_in_bounds(y(jg), job%profiles(ip), 2)) cycle
-              do k = 1, nzloc
-                kg = zs + k - 1
-                if (.not. coord_in_bounds(z(kg), job%profiles(ip), 3)) cycle
-                local_sum(ig) = local_sum(ig) + f(i,j,k) * area_weight
-                local_area(ig) = local_area(ig) + area_weight
-              end do
-            end do
-          end do
-        case('y')
-          do j = 1, nyloc
-            jg = ys + j - 1
-            if (.not. coord_in_bounds(y(jg), job%profiles(ip), 2)) cycle
-            do i = 1, nxloc
-              ig = xs + i - 1
-              if (.not. coord_in_bounds(x(ig), job%profiles(ip), 1)) cycle
-              do k = 1, nzloc
-                kg = zs + k - 1
-                if (.not. coord_in_bounds(z(kg), job%profiles(ip), 3)) cycle
-                local_sum(jg) = local_sum(jg) + f(i,j,k) * area_weight
-                local_area(jg) = local_area(jg) + area_weight
-              end do
-            end do
-          end do
-        case default
-          do k = 1, nzloc
-            kg = zs + k - 1
-            if (.not. coord_in_bounds(z(kg), job%profiles(ip), 3)) cycle
-            do i = 1, nxloc
-              ig = xs + i - 1
-              if (.not. coord_in_bounds(x(ig), job%profiles(ip), 1)) cycle
-              do j = 1, nyloc
-                jg = ys + j - 1
-                if (.not. coord_in_bounds(y(jg), job%profiles(ip), 2)) cycle
-                local_sum(kg) = local_sum(kg) + f(i,j,k) * area_weight
-                local_area(kg) = local_area(kg) + area_weight
-              end do
-            end do
-          end do
-        end select
-
-        call MPI_Allreduce(local_sum, global_sum, ni, mpi_rk, MPI_SUM, MPI_COMM_WORLD, ierr)
-        call MPI_Allreduce(local_area, global_area, ni, mpi_rk, MPI_SUM, MPI_COMM_WORLD, ierr)
-        avg = 0.0_rk
-        do i = 1, ni
-          if (global_area(i) > 0.0_rk) avg(i) = global_sum(i) / global_area(i)
-        end do
+        allocate(avg(ni))
+        call compute_bounded_linear_average(reader, x, y, z, Lx, Ly, Lz, f, job%profiles(ip), avg)
 
         if (myrank == 0) then
           stem = expr_output_stem_case(job%profiles(ip)%field, lists, job%profiles(ip)%field%nterms, icase)
@@ -1868,7 +1817,7 @@ contains
           call csv_profile_bounded(ni, trim(outname), job%profiles(ip)%axis, coord, avg, &
             job%profiles(ip), profile_axis, 'average')
         end if
-        deallocate(local_sum, global_sum, local_area, global_area, avg)
+        deallocate(avg)
       end do
     end do
   end subroutine run_linear_profiles
@@ -2168,7 +2117,7 @@ contains
     real(rk), allocatable, target :: x(:), y(:), z(:)
     real(rk), allocatable :: normalizer(:,:,:), ref(:,:,:), rhs(:,:,:)
     real(rk), allocatable :: recon(:,:,:), scratch(:,:,:)
-    real(rk), allocatable :: profile(:)
+    real(rk), allocatable :: profile(:), avg(:)
     type(field_case_set_t), allocatable :: case_sets(:)
     type(rms_spec_t) :: range_spec
     character(len=str_len) :: fname, ref_name
@@ -2247,6 +2196,7 @@ contains
 
     allocate(ref(nxloc,nyloc,nzloc), rhs(nxloc,nyloc,nzloc), recon(nxloc,nyloc,nzloc), &
       scratch(nxloc,nyloc,nzloc), profile(nx))
+    if (job%march%export_linear_average) allocate(avg(nx))
     if (norm_field_idx > 0) allocate(normalizer(nxloc,nyloc,nzloc))
 
     do icase = 1, ncases
@@ -2294,6 +2244,18 @@ contains
             call csv_profile_bounded(nx, trim(fname), 'x', x, profile, range_spec, 1, 'l2_norm')
           end if
         end if
+        if (job%march%export_linear_average) then
+          call compute_bounded_linear_average(reader, x, y, z, Lx, Ly, Lz, recon, range_spec, avg)
+          fname = trim(outdir)//'/'//trim(mode_name)//trim(case_suffix)//'_'//trim(ref_name)//'_avg_x.csv'
+          if (myrank == 0) then
+            call csv_profile_bounded(nx, trim(fname), 'x', x, avg, range_spec, 1, 'average')
+          end if
+          call compute_bounded_linear_average(reader, x, y, z, Lx, Ly, Lz, scratch, range_spec, avg)
+          fname = trim(outdir)//'/'//trim(mode_name)//trim(case_suffix)//'_error_avg_x.csv'
+          if (myrank == 0) then
+            call csv_profile_bounded(nx, trim(fname), 'x', x, avg, range_spec, 1, 'average')
+          end if
+        end if
 
         if (job%march%nslices > 0) then
           do islice = 1, job%march%nslices
@@ -2315,7 +2277,15 @@ contains
           call csv_profile_bounded(nx, trim(fname), 'x', x, profile, range_spec, 1, 'l2_norm')
         end if
       end if
+      if (job%march%export_linear_average) then
+        call compute_bounded_linear_average(reader, x, y, z, Lx, Ly, Lz, ref, range_spec, avg)
+        fname = trim(outdir)//'/'//trim(ref_name)//trim(case_suffix)//'_avg_x.csv'
+        if (myrank == 0) then
+          call csv_profile_bounded(nx, trim(fname), 'x', x, avg, range_spec, 1, 'average')
+        end if
+      end if
     end do
+    if (allocated(avg)) deallocate(avg)
   end subroutine run_march
 
   function march_case_suffix(icase, ncases) result(suffix)
@@ -2574,6 +2544,96 @@ contains
     profile = sqrt(global_sum)
     deallocate(local_sum, global_sum)
   end subroutine l2_profile_bounded
+
+  subroutine compute_bounded_linear_average(reader, x, y, z, Lx, Ly, Lz, f, item, profile)
+    class(FieldReader2Decomp), intent(inout) :: reader
+    real(rk), intent(in) :: x(:), y(:), z(:), Lx, Ly, Lz, f(:,:,:)
+    type(rms_spec_t), intent(in) :: item
+    real(rk), intent(out) :: profile(:)
+    integer :: nx, ny, nz, nxloc, nyloc, nzloc, xs, xe, ys, ye, zs, ze
+    integer :: i, j, k, ig, jg, kg, ni, ierr
+    real(rk) :: dx, dy, dz, area_weight
+    real(rk), allocatable :: local_sum(:), global_sum(:), local_area(:), global_area(:)
+
+    call reader%global_shape(nx, ny, nz)
+    call reader%local_shape(nxloc, nyloc, nzloc)
+    call reader%indices(xs, xe, ys, ye, zs, ze)
+    dx = Lx / real(nx, rk)
+    dy = Ly / real(ny, rk)
+    dz = Lz / real(nz, rk)
+
+    select case(item%axis)
+    case('x')
+      ni = nx
+      area_weight = dy * dz
+    case('y')
+      ni = ny
+      area_weight = dx * dz
+    case default
+      ni = nz
+      area_weight = dx * dy
+    end select
+
+    allocate(local_sum(ni), global_sum(ni), local_area(ni), global_area(ni))
+    local_sum = 0.0_rk
+    local_area = 0.0_rk
+
+    select case(item%axis)
+    case('x')
+      do i = 1, nxloc
+        ig = xs + i - 1
+        if (.not. coord_in_bounds(x(ig), item, 1)) cycle
+        do j = 1, nyloc
+          jg = ys + j - 1
+          if (.not. coord_in_bounds(y(jg), item, 2)) cycle
+          do k = 1, nzloc
+            kg = zs + k - 1
+            if (.not. coord_in_bounds(z(kg), item, 3)) cycle
+            local_sum(ig) = local_sum(ig) + f(i,j,k) * area_weight
+            local_area(ig) = local_area(ig) + area_weight
+          end do
+        end do
+      end do
+    case('y')
+      do j = 1, nyloc
+        jg = ys + j - 1
+        if (.not. coord_in_bounds(y(jg), item, 2)) cycle
+        do i = 1, nxloc
+          ig = xs + i - 1
+          if (.not. coord_in_bounds(x(ig), item, 1)) cycle
+          do k = 1, nzloc
+            kg = zs + k - 1
+            if (.not. coord_in_bounds(z(kg), item, 3)) cycle
+            local_sum(jg) = local_sum(jg) + f(i,j,k) * area_weight
+            local_area(jg) = local_area(jg) + area_weight
+          end do
+        end do
+      end do
+    case default
+      do k = 1, nzloc
+        kg = zs + k - 1
+        if (.not. coord_in_bounds(z(kg), item, 3)) cycle
+        do i = 1, nxloc
+          ig = xs + i - 1
+          if (.not. coord_in_bounds(x(ig), item, 1)) cycle
+          do j = 1, nyloc
+            jg = ys + j - 1
+            if (.not. coord_in_bounds(y(jg), item, 2)) cycle
+            local_sum(kg) = local_sum(kg) + f(i,j,k) * area_weight
+            local_area(kg) = local_area(kg) + area_weight
+          end do
+        end do
+      end do
+    end select
+
+    call MPI_Allreduce(local_sum, global_sum, ni, mpi_rk, MPI_SUM, MPI_COMM_WORLD, ierr)
+    call MPI_Allreduce(local_area, global_area, ni, mpi_rk, MPI_SUM, MPI_COMM_WORLD, ierr)
+    profile = 0.0_rk
+    do i = 1, ni
+      if (global_area(i) > 0.0_rk) profile(i) = global_sum(i) / global_area(i)
+    end do
+    deallocate(local_sum, global_sum, local_area, global_area)
+  end subroutine compute_bounded_linear_average
 
   subroutine export_x_plane_to_netcdf(reader, fname, varname, f, idx, y, z)
     class(FieldReader2Decomp), intent(inout) :: reader

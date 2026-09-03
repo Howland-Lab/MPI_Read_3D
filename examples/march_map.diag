@@ -8,6 +8,7 @@ march {
   end = 220.0
   scheme = euler
   rms = true
+  linear_average = true
   slices = 205.0,210.0,215.0,220.0
 }
 
