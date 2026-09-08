@@ -126,6 +126,10 @@ module MPIR3D_Lean
     character(len=32) :: scheme = 'euler'
     logical :: export_rms = .false.
     logical :: export_linear_average = .false.
+    real(rk) :: bounds_min(3) = [-huge(1.0_rk), -huge(1.0_rk), -huge(1.0_rk)]
+    real(rk) :: bounds_max(3) = [ huge(1.0_rk),  huge(1.0_rk),  huge(1.0_rk)]
+    logical :: has_min(3) = [.false., .false., .false.]
+    logical :: has_max(3) = [.false., .false., .false.]
     integer :: nslices = 0
     real(rk), allocatable :: slices(:)
     integer :: nmodes = 0
@@ -907,6 +911,7 @@ contains
     character(len=str_len) :: line, clean, low, val
     integer :: ios, nvals
     real(rk), allocatable :: vals(:)
+    type(rms_spec_t) :: bounds_item
 
     ierr = 0
     do
@@ -946,6 +951,14 @@ contains
         val = value_after_equals(clean)
         call parse_logical_value(trim(val), job%march%export_linear_average, ierr)
         if (ierr /= 0) return
+      else if (key_is(low, 'bounds')) then
+        val = value_after_equals(clean)
+        call parse_bounds_csv(trim(val), bounds_item, ierr)
+        if (ierr /= 0) return
+        job%march%bounds_min = bounds_item%bounds_min
+        job%march%bounds_max = bounds_item%bounds_max
+        job%march%has_min = bounds_item%has_min
+        job%march%has_max = bounds_item%has_max
       else if (key_is(low, 'slices')) then
         val = value_after_equals(clean)
         call parse_real_csv(trim(val), vals, nvals, ierr)
@@ -2149,12 +2162,30 @@ contains
     range_spec%bounds_max(1) = max(x(istart), x(iend))
     range_spec%has_min(1) = .true.
     range_spec%has_max(1) = .true.
+    range_spec%bounds_min(2:3) = job%march%bounds_min(2:3)
+    range_spec%bounds_max(2:3) = job%march%bounds_max(2:3)
+    range_spec%has_min(2:3) = job%march%has_min(2:3)
+    range_spec%has_max(2:3) = job%march%has_max(2:3)
+    if (job%march%has_min(1)) then
+      range_spec%bounds_min(1) = max(range_spec%bounds_min(1), job%march%bounds_min(1))
+    end if
+    if (job%march%has_max(1)) then
+      range_spec%bounds_max(1) = min(range_spec%bounds_max(1), job%march%bounds_max(1))
+    end if
+    if (range_spec%bounds_min(1) > range_spec%bounds_max(1)) then
+      call message('ERROR: march bounds exclude the requested x march interval.')
+      call MPI_Abort(MPI_COMM_WORLD, 724, ierr)
+    end if
     if (myrank == 0) then
       call message('MARCH: requested start='//trim(real_to_tag(job%march%start))// &
         ', using x('//trim(int_to_string(istart))//')='//trim(real_to_tag(x(istart))))
       call message('MARCH: requested end='//trim(real_to_tag(job%march%finish))// &
         ', using x('//trim(int_to_string(iend))//')='//trim(real_to_tag(x(iend))))
       call message('MARCH: scheme='//trim(job%march%scheme))
+      call message('MARCH: averaging bounds x=['//trim(real_to_tag(range_spec%bounds_min(1)))//', ' &
+        //trim(real_to_tag(range_spec%bounds_max(1)))//'], y=['//trim(real_to_tag(range_spec%bounds_min(2)))//', ' &
+        //trim(real_to_tag(range_spec%bounds_max(2)))//'], z=['//trim(real_to_tag(range_spec%bounds_min(3)))//', ' &
+        //trim(real_to_tag(range_spec%bounds_max(3)))//']')
     end if
     if (job%march%nslices > 0) then
       allocate(slice_idx(job%march%nslices))

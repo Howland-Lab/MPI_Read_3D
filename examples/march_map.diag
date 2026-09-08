@@ -9,6 +9,9 @@ march {
   scheme = euler
   rms = true
   linear_average = true
+  # Optional bounded averaging box.  Keep x open here because start/end define
+  # the march interval; y/z are the cross-plane averaging limits.
+  bounds = *,*,10.0,45.0,0.0,55.55555556
   slices = 205.0,210.0,215.0,220.0
 }
 

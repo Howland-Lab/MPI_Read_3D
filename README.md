@@ -225,6 +225,9 @@ stations, and logs the selected indices. Set `scheme = euler` or
 optional. If either named field is missing from `fields {}`, the run stops.
 Every other field in `fields {}` is treated as an RHS term unless a mode lists
 it under `remove`.
+The march driver also accepts the same six-value `bounds = xmin,xmax,ymin,ymax,zmin,zmax`
+syntax used by the `rms` and `profile` maps. Those bounds limit the RMS and
+linear-average reductions written for the marched reference and error fields.
 
 ```text
 driver = march
@@ -238,6 +241,7 @@ march {
   scheme = euler
   rms = true
   linear_average = true
+  bounds = *,*,10.0,45.0,0.0,55.55555556
   slices = 205.0,210.0,215.0,220.0
 }
 
