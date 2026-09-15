@@ -6,7 +6,7 @@ march {
   normalizer = uinf
   start = 200.0
   end = 220.0
-  scheme = euler
+  scheme = rk4
   rms = true
   linear_average = true
   # Optional bounded averaging box.  Keep x open here because start/end define

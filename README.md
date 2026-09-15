@@ -220,8 +220,12 @@ The `march` driver reconstructs a named reference field from
 `d(field)/dx = RHS`, optionally using `d(field)/dx = RHS / normalizer`. It
 starts from the LES `reference` plane at `march%start`. It currently supports
 `axis = x`, uses nearest grid points for `start`, `end`, and requested slice
-stations, and logs the selected indices. Set `scheme = euler` or
-`scheme = trapezoid`. The `reference` field is required; `normalizer` is
+stations, and logs the selected indices. Set `scheme = euler`,
+`scheme = trapezoid`, or `scheme = rk4`. The trapezoidal option uses a
+one-sided second-order Adams-Bashforth update after the first step. The `rk4`
+option name is accepted for a one-sided fourth-order Adams-Bashforth update,
+with lower-order startup steps until enough upstream planes are available.
+The `reference` field is required; `normalizer` is
 optional. If either named field is missing from `fields {}`, the run stops.
 Every other field in `fields {}` is treated as an RHS term unless a mode lists
 it under `remove`.
@@ -238,7 +242,7 @@ march {
   normalizer = uinf
   start = 200.0
   end = 220.0
-  scheme = euler
+  scheme = rk4
   rms = true
   linear_average = true
   bounds = *,*,10.0,45.0,0.0,55.55555556

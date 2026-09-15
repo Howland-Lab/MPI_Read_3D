@@ -970,7 +970,7 @@ contains
     end do
 
     if (.not. any(job%march%axis == ['x','y','z'])) ierr = 702
-    if (trim(job%march%scheme) /= 'euler' .and. trim(job%march%scheme) /= 'trapezoid') ierr = 703
+    if (.not. is_march_scheme_supported(job%march%scheme)) ierr = 703
   end subroutine read_march_block
 
   subroutine read_modes_block(unit, job, ierr)
@@ -2432,19 +2432,148 @@ contains
     real(rk), intent(out) :: recon(:,:,:)
     integer, intent(in) :: istart, iend
     character(*), intent(in) :: scheme
-    integer :: i, idir
+    integer :: i, idir, ip1, ip2, im1, im2, im3, nxloc
+    character(len=32) :: scheme_name
+    real(rk), allocatable :: fmid(:,:)
+
     recon = ref
     idir = merge(1, -1, iend >= istart)
     if (istart == iend) return
+    nxloc = size(dfdx, 1)
+    scheme_name = normalize_march_scheme(scheme)
+
+    if (trim(scheme_name) == 'rk4' .and. myrank == 0) then
+      call message('WARNING: march scheme = rk4 uses future dfdx samples (non-causal). '// &
+        'Comparison/diagnostic use only; not a valid single-slice march.')
+    end if
+
     do i = istart, iend - idir, idir
-      if (trim(scheme) == 'trapezoid') then
-        recon(i+idir,:,:) = recon(i,:,:) + real(idir, rk) * dx * &
-          0.5_rk * (dfdx(i,:,:) + dfdx(i+idir,:,:))
-      else
-        recon(i+idir,:,:) = recon(i,:,:) + real(idir, rk) * dx * dfdx(i,:,:)
-      end if
+      ip1 = i + idir
+      im1 = i - idir
+      im2 = i - 2 * idir
+      im3 = i - 3 * idir
+      ip2 = i + 2 * idir
+
+      select case(trim(scheme_name))
+      case('rk4')
+        ! RK4 on a state-independent RHS reduces exactly to Simpson's rule:
+        !   y_{i+1} = y_i + dx/6 * ( g_i + 4*g_{i+1/2} + g_{i+1} )
+        ! g_{i+1/2} is not on the grid, so it is interpolated from the
+        ! surrounding samples (cubic where a full 4-point stencil is
+        ! available, quadratic/linear one-sided near the domain edges).
+        fmid = midpoint_value(dfdx, im1, i, ip1, ip2, nxloc)
+        recon(ip1,:,:) = recon(i,:,:) + real(idir, rk) * dx / 6.0_rk * &
+          ( dfdx(i,:,:) + 4.0_rk * fmid + dfdx(ip1,:,:) )
+
+      case('nystrom2')
+        if (history_ok(im1, istart, idir, nxloc)) then
+          recon(ip1,:,:) = recon(im1,:,:) + 2.0_rk * real(idir, rk) * dx * dfdx(i,:,:)
+        else
+          recon(ip1,:,:) = recon(i,:,:) + real(idir, rk) * dx * dfdx(i,:,:)
+        end if
+
+      case('ab2')
+        if (history_ok(im1, istart, idir, nxloc)) then
+          recon(ip1,:,:) = recon(i,:,:) + real(idir, rk) * dx * &
+            (1.5_rk * dfdx(i,:,:) - 0.5_rk * dfdx(im1,:,:))
+        else
+          recon(ip1,:,:) = recon(i,:,:) + real(idir, rk) * dx * dfdx(i,:,:)
+        end if
+
+      case('ab3')
+        if (history_ok(im2, istart, idir, nxloc)) then
+          recon(ip1,:,:) = recon(i,:,:) + real(idir, rk) * dx * &
+            (23.0_rk * dfdx(i,:,:) - 16.0_rk * dfdx(im1,:,:) + &
+              5.0_rk * dfdx(im2,:,:)) / 12.0_rk
+        else if (history_ok(im1, istart, idir, nxloc)) then
+          recon(ip1,:,:) = recon(i,:,:) + real(idir, rk) * dx * &
+            (1.5_rk * dfdx(i,:,:) - 0.5_rk * dfdx(im1,:,:))
+        else
+          recon(ip1,:,:) = recon(i,:,:) + real(idir, rk) * dx * dfdx(i,:,:)
+        end if
+
+      case('ab4')
+        if (history_ok(im3, istart, idir, nxloc)) then
+          recon(ip1,:,:) = recon(i,:,:) + real(idir, rk) * dx * &
+            (55.0_rk * dfdx(i,:,:) - 59.0_rk * dfdx(im1,:,:) + &
+             37.0_rk * dfdx(im2,:,:) -  9.0_rk * dfdx(im3,:,:)) / 24.0_rk
+        else if (history_ok(im2, istart, idir, nxloc)) then
+          recon(ip1,:,:) = recon(i,:,:) + real(idir, rk) * dx * &
+            (23.0_rk * dfdx(i,:,:) - 16.0_rk * dfdx(im1,:,:) + &
+              5.0_rk * dfdx(im2,:,:)) / 12.0_rk
+        else if (history_ok(im1, istart, idir, nxloc)) then
+          recon(ip1,:,:) = recon(i,:,:) + real(idir, rk) * dx * &
+            (1.5_rk * dfdx(i,:,:) - 0.5_rk * dfdx(im1,:,:))
+        else
+          recon(ip1,:,:) = recon(i,:,:) + real(idir, rk) * dx * dfdx(i,:,:)
+        end if
+
+      case default  ! euler / ab1
+        recon(ip1,:,:) = recon(i,:,:) + real(idir, rk) * dx * dfdx(i,:,:)
+      end select
     end do
+
+  contains
+
+    pure logical function history_ok(idx, istart_, idir_, nxloc_)
+      integer, intent(in) :: idx, istart_, idir_, nxloc_
+      history_ok = (idx - istart_) * idir_ >= 0 .and. idx >= 1 .and. idx <= nxloc_
+    end function history_ok
+
+    function midpoint_value(dfdx_, im1_, i_, ip1_, ip2_, nxloc_) result(fmid_)
+      real(rk), intent(in) :: dfdx_(:,:,:)
+      integer, intent(in) :: im1_, i_, ip1_, ip2_, nxloc_
+      real(rk), allocatable :: fmid_(:,:)        ! <-- was (:,:,:)
+      logical :: have_im1, have_ip2
+
+      have_im1 = (im1_ >= 1 .and. im1_ <= nxloc_)
+      have_ip2 = (ip2_ >= 1 .and. ip2_ <= nxloc_)
+
+      if (have_im1 .and. have_ip2) then
+        fmid_ = ( -dfdx_(im1_,:,:) + 9.0_rk * dfdx_(i_,:,:) + &
+                    9.0_rk * dfdx_(ip1_,:,:) - dfdx_(ip2_,:,:) ) / 16.0_rk
+      else if (have_ip2) then
+        fmid_ = ( 3.0_rk * dfdx_(i_,:,:) + 6.0_rk * dfdx_(ip1_,:,:) - &
+                  dfdx_(ip2_,:,:) ) / 8.0_rk
+      else if (have_im1) then
+        fmid_ = ( -dfdx_(im1_,:,:) + 6.0_rk * dfdx_(i_,:,:) + &
+                  3.0_rk * dfdx_(ip1_,:,:) ) / 8.0_rk
+      else
+        fmid_ = 0.5_rk * (dfdx_(i_,:,:) + dfdx_(ip1_,:,:))
+      end if
+    end function midpoint_value
+
   end subroutine integrate_march_x
+
+  pure function normalize_march_scheme(scheme) result(name)
+    character(*), intent(in) :: scheme
+    character(len=32) :: name
+    name = trim(lower(scheme))
+    select case(trim(name))
+    case('euler', 'ab1')
+      name = 'euler'
+    case('adams-bashforth2', 'adams_bashforth2', 'ab2')
+      name = 'ab2'
+    case('adams-bashforth3', 'adams_bashforth3', 'ab3')
+      name = 'ab3'
+    case('adams-bashforth4', 'adams_bashforth4', 'ab4')
+      name = 'ab4'
+    case('nystrom', 'nystrom2', 'leapfrog', 'midpoint2')
+      name = 'nystrom2'
+    case('rk4', 'runge-kutta', 'runge_kutta', 'rungekutta', &
+         'runge-kutta4', 'runge_kutta4')
+      name = 'rk4'
+    end select
+  end function normalize_march_scheme
+
+  pure logical function is_march_scheme_supported(scheme)
+    character(*), intent(in) :: scheme
+    character(len=32) :: name
+    name = normalize_march_scheme(scheme)
+    is_march_scheme_supported = trim(name) == 'euler' .or. trim(name) == 'ab2' .or. &
+      trim(name) == 'ab3' .or. trim(name) == 'ab4' .or. trim(name) == 'nystrom2' .or. &
+      trim(name) == 'rk4'
+  end function is_march_scheme_supported
 
   subroutine subtract_crossplane_reference(reader, f, item, ref)
     class(FieldReader2Decomp), intent(inout) :: reader
