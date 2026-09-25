@@ -29,7 +29,7 @@ module MPIR3D_Lean
   integer, parameter :: rk = mytype
   integer, parameter :: mpi_rk = merge(MPI_DOUBLE_PRECISION, MPI_REAL, rk == kind(1.0d0))
   integer, parameter :: nc_rk = merge(NF90_DOUBLE, NF90_FLOAT, rk == kind(1.0d0))
-  integer, parameter :: str_len = 2048
+  integer, parameter :: str_len = 8192
   integer, parameter :: name_len = 128
   integer :: myrank = -1
   integer :: nprocs = -1
@@ -313,6 +313,9 @@ contains
       end if
     end do
     if (last_dot <= 1) then
+      stem = filename(:n)
+    else if (last_dot < n .and. verify(filename(last_dot+1:n), '0123456789') == 0) then
+      ! Restart files use a numeric suffix as the timestep, not a file extension.
       stem = filename(:n)
     else
       stem = filename(:last_dot-1)
@@ -732,14 +735,24 @@ contains
     type(file_list_t), intent(in) :: lists(:)
     integer, intent(in) :: nlists, icase
     character(len=:), allocatable :: stem
-    character(len=:), allocatable :: leaf
-    integer :: i, idx
+    character(len=:), allocatable :: leaf, other_leaf
+    character(len=32) :: case_tag
+    integer :: i, j, idx
 
     do i = 1, nlists
       if (lists(i)%n > 1) then
         ! For multi-wildcard compositions, the first time-varying term names the output case.
         idx = min(icase, lists(i)%n)
         leaf = strip_extension(trim(basename_only(trim(lists(i)%names(idx)))))
+        do j = 1, lists(i)%n
+          if (j == idx) cycle
+          other_leaf = strip_extension(trim(basename_only(trim(lists(i)%names(j)))))
+          if (leaf /= other_leaf) cycle
+          ! Keep a unique case tag even if extensions or directories differ only.
+          write(case_tag, '(I0)') idx
+          leaf = trim(basename_only(trim(lists(i)%names(idx))))//'_case'//trim(case_tag)
+          exit
+        end do
         if (len_trim(expr%name) > 0) then
           stem = trim(expr%name)//'_'//trim(leaf)
         else
@@ -1612,7 +1625,11 @@ contains
         do icase = 1, ncases
           call assemble_terms_case(reader, job%fields(i)%u_terms, job%fields(i)%nu_terms, u_lists, icase, f, scratch)
           call assemble_terms_case(reader, job%fields(i)%v_terms, job%fields(i)%nv_terms, v_lists, icase, f2, scratch)
-          stem = expr_output_stem_case(job%fields(i), u_lists, job%fields(i)%nu_terms, icase)
+          if (ncases_u > 1 .or. ncases_v == 1) then
+            stem = expr_output_stem_case(job%fields(i), u_lists, job%fields(i)%nu_terms, icase)
+          else
+            stem = expr_output_stem_case(job%fields(i), v_lists, job%fields(i)%nv_terms, icase)
+          end if
 
           ! WS profile is <sqrt(u*u + v*v)>, not sqrt(<u>**2 + <v>**2).
           scratch = sqrt(f*f + f2*f2)

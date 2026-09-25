@@ -159,6 +159,11 @@ For wildcard input, the driver writes one output per match, for example
 `wind_Run05_uVel_t000900_WS_HA_z.csv` and
 `wind_Run05_uVel_t000900_WD_HA_z.csv`. The sorted `u` and `v` matches are
 paired one-to-one, so use filename patterns that sort in timestep order.
+Numeric restart suffixes are retained: `RESTART_Run01_u.000001` produces
+`wind_RESTART_Run01_u.000001_WS_HA_z.csv` (and the corresponding WD file).
+If removing extensions would give multiple matches the same output stem,
+the full basename and a `_caseN` tag distinguish them. When only `v` has
+multiple matches, its filenames supply the case names.
 
 Wind speed is the horizontal mean of pointwise `sqrt(u*u + v*v)`. Wind
 direction is computed from the horizontally averaged vector,
