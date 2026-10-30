@@ -4,6 +4,7 @@ march {
   axis = x
   reference = deltau_les
   normalizer = uinf
+  full_mode = G0
   start = 200.0
   end = 220.0
   scheme = rk4

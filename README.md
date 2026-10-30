@@ -119,6 +119,23 @@ slices {
 }
 ```
 
+Integrated slices omit `coords`. Use `integrate = 1` for `integral f d_axis`,
+`integrate = 2` for `sqrt(integral f**2 d_axis)`, or `integrate = -2` for
+`integral f**2 d_axis` without taking the square root. Grid-spacing weights
+are included; domain-length normalization is done offline. For example:
+
+```text
+slices {
+  axis = y
+  integrate = -2
+}
+```
+
+This writes `<stem>_integ_y_-2.nc` on the full x-z grid. Integrating this
+slice over a height interval of length `H` gives the squared-field area
+integral; divide by `Ly*H` and then take the square root to obtain an RMS
+profile in x.
+
 Wildcards in filenames are treated as a time/case dimension, not as a
 summation. The program expands each wildcard pattern as a sorted list and runs
 the selected driver once per case. In a composed field, each term must expand
@@ -245,6 +262,7 @@ march {
   axis = x
   reference = deltau_les
   normalizer = uinf
+  full_mode = G0
   start = 200.0
   end = 220.0
   scheme = rk4
@@ -278,6 +296,21 @@ field, each mode reconstruction, and each mode error.
 The march profile filenames use `_rms_` or `_avg_`, for example
 `G0_deltau_les_rms_x.csv`, `G0_deltau_les_avg_x.csv`, `G0_error_rms_x.csv`,
 and `G0_error_avg_x.csv`.
+
+Optionally set `full_mode = G0` in `march {}` to also compare each other
+mode against the full reconstruction. The name is matched case-insensitively
+and must identify exactly one mode with an empty `remove` list. Full means all
+RHS fields declared in `fields {}`, excluding the reference and normalizer.
+The selected mode is computed first for each input case, regardless of its
+position in `modes {}`, using the same LES initial condition and march settings.
+
+These additional outputs reduce `reconstruction - full_reconstruction` using
+the same bounds and output flags as the LES errors. For example:
+`G1_error_vs_G0_rms_x.csv`, `G1_error_vs_G0_avg_x.csv`, and
+`G1_error_vs_G0_SL_x=205.nc`. Wildcard cases retain the `_caseN` suffix after
+the mode name. The full mode has no self-comparison outputs. Existing LES-error
+filenames and results are preserved; omitting `full_mode` disables the additional
+comparisons. The `rms` output retains the cross-plane L2 convention above.
 
 ## Examples
 

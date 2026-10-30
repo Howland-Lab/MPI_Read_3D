@@ -121,6 +121,7 @@ module MPIR3D_Lean
     character(len=1) :: axis = 'x'
     character(len=name_len) :: reference = ''
     character(len=name_len) :: normalizer = ''
+    character(len=name_len) :: full_mode = ''
     real(rk) :: start = 0.0_rk
     real(rk) :: finish = 0.0_rk
     character(len=32) :: scheme = 'euler'
@@ -944,6 +945,8 @@ contains
         job%march%axis = val(1:1)
       else if (key_is(low, 'reference')) then
         job%march%reference = trim(value_after_equals(clean))
+      else if (key_is(low, 'full_mode')) then
+        job%march%full_mode = trim(value_after_equals(clean))
       else if (key_is(low, 'normalizer')) then
         job%march%normalizer = trim(value_after_equals(clean))
       else if (key_is(low, 'start')) then
@@ -1180,7 +1183,7 @@ contains
       ierr = 201
       return
     end if
-    if (slice%integrate > 0 .and. slice%ncoords > 0) then
+    if ((slice%integrate > 0 .or. slice%integrate == -2) .and. slice%ncoords > 0) then
       call message('WARNING: coords ignored for integrated slice block.')
     end if
     call append_slice(job%slices, job%nslices, slice)
@@ -1923,7 +1926,7 @@ contains
 
     allocate(local0(nx1,nx2), global0(nx1,nx2))
 
-    if (spec%integrate > 0) then
+    if (spec%integrate > 0 .or. spec%integrate == -2) then
       local0 = 0.0_rk
       select case(spec%axis)
       case('x'); delta = Lx / real(nax, rk)
@@ -1937,11 +1940,14 @@ contains
         case('y'); plane => f(:,jloc,:)
         case default; plane => f(:,:,jloc)
         end select
-        local0(x1s:x1e,x2s:x2e) = local0(x1s:x1e,x2s:x2e) + plane**spec%integrate * delta
+        local0(x1s:x1e,x2s:x2e) = local0(x1s:x1e,x2s:x2e) + plane**abs(spec%integrate) * delta
       end do
       call MPI_Reduce(local0, global0, nx1*nx2, mpi_rk, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
       if (myrank == 0) then
-        global0 = global0**(1.0_rk / real(spec%integrate, rk))
+        ! Mode -2 exports the squared-field integral without taking the root.
+        if (spec%integrate > 0) then
+          global0 = global0**(1.0_rk / real(spec%integrate, rk))
+        end if
         fname = trim(outdir)//'/'//trim(stem)//'_integ_'//spec%axis//'_'//trim(int_to_string(spec%integrate))//'.nc'
         call export_slice_to_netcdf(trim(fname), trim(stem), global0, x1, x2, x1name, x2name)
       end if
@@ -2141,16 +2147,16 @@ contains
     type(diag_job_t), intent(in) :: job
     integer :: nx, ny, nz, nxloc, nyloc, nzloc, xs, xe, ys_dum, ye_dum, zs_dum, ze_dum
     integer :: norm_field_idx, ref_field_idx, ierr, imode, field_idx, icase, ncases
-    integer :: istart, iend, islice, idx
+    integer :: istart, iend, islice, idx, full_mode_idx, mode_step
     integer, allocatable :: slice_idx(:)
     real(rk) :: dx
     real(rk), allocatable, target :: x(:), y(:), z(:)
     real(rk), allocatable :: normalizer(:,:,:), ref(:,:,:), rhs(:,:,:)
-    real(rk), allocatable :: recon(:,:,:), scratch(:,:,:)
+    real(rk), allocatable :: recon(:,:,:), scratch(:,:,:), full_recon(:,:,:)
     real(rk), allocatable :: profile(:), avg(:)
     type(field_case_set_t), allocatable :: case_sets(:)
     type(rms_spec_t) :: range_spec
-    character(len=str_len) :: fname, ref_name
+    character(len=str_len) :: fname, ref_name, full_error_name
     character(len=name_len) :: mode_name
     character(len=32) :: case_suffix
 
@@ -2240,10 +2246,11 @@ contains
     end if
 
     call prepare_field_case_sets(path, job, case_sets, ncases)
-    call validate_march_modes(job, ref_field_idx, norm_field_idx)
+    call validate_march_modes(job, ref_field_idx, norm_field_idx, full_mode_idx)
 
     allocate(ref(nxloc,nyloc,nzloc), rhs(nxloc,nyloc,nzloc), recon(nxloc,nyloc,nzloc), &
       scratch(nxloc,nyloc,nzloc), profile(nx))
+    if (full_mode_idx > 0) allocate(full_recon(nxloc,nyloc,nzloc))
     if (job%march%export_linear_average) allocate(avg(nx))
     if (norm_field_idx > 0) allocate(normalizer(nxloc,nyloc,nzloc))
 
@@ -2263,7 +2270,16 @@ contains
         end do
       end if
 
-      do imode = 1, job%march%nmodes
+      do mode_step = 1, job%march%nmodes
+        ! Evaluate the full mode first, then the other modes in input order.
+        imode = mode_step
+        if (full_mode_idx > 0) then
+          if (mode_step == 1) then
+            imode = full_mode_idx
+          else if (mode_step <= full_mode_idx) then
+            imode = mode_step - 1
+          end if
+        end if
         mode_name = trim(job%march%modes(imode)%name)
         rhs = 0.0_rk
         do field_idx = 1, job%nfields
@@ -2277,6 +2293,7 @@ contains
           rhs = rhs / normalizer
         end if
         call integrate_march_x(ref, rhs, recon, dx, istart, iend, trim(job%march%scheme))
+        if (imode == full_mode_idx) full_recon(:,:,:) = recon
         ! Reuse scratch as the 3D error field after file assembly is complete.
         scratch = recon - ref
 
@@ -2314,6 +2331,33 @@ contains
             fname = trim(outdir)//'/'//trim(mode_name)//trim(case_suffix)//'_error_SL_x='// &
               trim(real_to_tag(x(idx)))//'.nc'
             call export_x_plane_to_netcdf(reader, trim(fname), trim(mode_name)//'_error', scratch, idx, y, z)
+          end do
+        end if
+        if (full_mode_idx > 0 .and. imode /= full_mode_idx) then
+          scratch = recon - full_recon
+          full_error_name = trim(mode_name)//'_error_vs_'//trim(job%march%modes(full_mode_idx)%name)
+          if (job%march%export_rms) then
+            call l2_profile_bounded(reader, x, y, z, Lx, Ly, Lz, scratch, range_spec, profile)
+            fname = trim(outdir)//'/'//trim(mode_name)//trim(case_suffix)// &
+              '_error_vs_'//trim(job%march%modes(full_mode_idx)%name)//'_rms_x.csv'
+            if (myrank == 0) then
+              call csv_profile_bounded(nx, trim(fname), 'x', x, profile, range_spec, 1, 'l2_norm')
+            end if
+          end if
+          if (job%march%export_linear_average) then
+            call compute_bounded_linear_average(reader, x, y, z, Lx, Ly, Lz, scratch, range_spec, avg)
+            fname = trim(outdir)//'/'//trim(mode_name)//trim(case_suffix)// &
+              '_error_vs_'//trim(job%march%modes(full_mode_idx)%name)//'_avg_x.csv'
+            if (myrank == 0) then
+              call csv_profile_bounded(nx, trim(fname), 'x', x, avg, range_spec, 1, 'average')
+            end if
+          end if
+          do islice = 1, job%march%nslices
+            idx = slice_idx(islice)
+            fname = trim(outdir)//'/'//trim(mode_name)//trim(case_suffix)// &
+              '_error_vs_'//trim(job%march%modes(full_mode_idx)%name)//'_SL_x='// &
+              trim(real_to_tag(x(idx)))//'.nc'
+            call export_x_plane_to_netcdf(reader, trim(fname), trim(full_error_name), scratch, idx, y, z)
           end do
         end if
       end do
@@ -2372,10 +2416,30 @@ contains
     end do
   end function mode_removes_field
 
-  subroutine validate_march_modes(job, ref_field_idx, norm_field_idx)
+  subroutine validate_march_modes(job, ref_field_idx, norm_field_idx, full_mode_idx)
     type(diag_job_t), intent(in) :: job
     integer, intent(in) :: ref_field_idx, norm_field_idx
-    integer :: imode, iremove, remove_idx
+    integer, intent(out) :: full_mode_idx
+    integer :: imode, iremove, remove_idx, matches, ierr
+
+    full_mode_idx = 0
+    if (len_trim(job%march%full_mode) > 0) then
+      matches = 0
+      do imode = 1, job%march%nmodes
+        if (trim(lower(job%march%modes(imode)%name)) /= trim(lower(job%march%full_mode))) cycle
+        matches = matches + 1
+        full_mode_idx = imode
+      end do
+      if (matches /= 1) then
+        call message('ERROR: march full_mode must identify exactly one mode: '//trim(job%march%full_mode))
+        call MPI_Abort(MPI_COMM_WORLD, 728, ierr)
+      end if
+      if (job%march%modes(full_mode_idx)%nremove /= 0) then
+        call message('ERROR: march full_mode must have an empty removal list: '//trim(job%march%full_mode))
+        call MPI_Abort(MPI_COMM_WORLD, 729, ierr)
+      end if
+    end if
+
     do imode = 1, job%march%nmodes
       do iremove = 1, job%march%modes(imode)%nremove
         remove_idx = find_field(job, trim(job%march%modes(imode)%remove(iremove)))

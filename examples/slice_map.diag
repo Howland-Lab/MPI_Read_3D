@@ -43,3 +43,10 @@ slices {
   axis = z
   integrate = 2
 }
+
+# Export integral field**2 dy without taking the square root, so the
+# resulting x-z slice can be integrated over selected z intervals offline.
+slices {
+  axis = y
+  integrate = -2
+}
